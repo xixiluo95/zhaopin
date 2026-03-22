@@ -41,6 +41,7 @@ crawler/extension/test-runner.html
 feishu/
 spiders/
 controller/OPENCLAW_PROTOCOL.md
+controller/README.md
 controller/cleanup_feishu_alerts.js
 controller/batches/beijing_pm_full_coverage.json
 controller/batches/hangzhou_pm_full_coverage.json
@@ -59,3 +60,5 @@ EXECUTION_PLAN*.md
 *_REPORT.md
 RUNTIME_CONFIG_SYNC.md
 PHASE1_LIVE_ACCEPTANCE_PLAN.md
+GITHUB_PRIVATE_PUSH_CHECKLIST.md
+docs/ARCHITECTURE.md
