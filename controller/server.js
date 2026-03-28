@@ -12,37 +12,44 @@ const {
   DEFAULT_DB_PATH,
   SCHEMA_VERSION,
   insertDeliveryRecord,
-  closeDatabase
+  closeDatabase,
+  createPageTask,
+  updatePageTaskStatus,
+  getPendingPageTasks,
+  resetRunningPageTasks
 } = require('./db');
 const {
   fetchDeliveryStats,
   fetchDeliveryRecords
 } = require('./delivery-stats');
+const { fetchCompanyEnrichmentStats } = require('./company-enrichment-stats');
 const {
   initFeishuClient,
   getTargetsFilePath,
   targetExists,
   resolveDeliveryTarget,
   listTargets,
-  testTarget
+  testTarget,
+  fetchFieldDefinitions
 } = require('./feishu-client');
 const deliveryWorker = require('./delivery-worker');
+const companyEnrichmentWorker = require('./company-enrichment-worker');
+const jobsHandler = require('./jobs-handler');
+const resumeHandler = require('./resume-handler');
+const { exportPDF } = require('./services/pdf-exporter');
+const aiHandler = require('./ai-handler');
+const {
+  RUNTIME_CONFIG_FILE,
+  DEFAULT_RUNTIME_CONFIG,
+  sanitizeRuntimeConfig,
+  readRuntimeConfig
+} = require('./runtime-config');
 
 const PORT = parseInt(process.env.CONTROLLER_PORT || '7893', 10);
 const QUEUE_FILE = path.join(__dirname, 'task_queue.json');
 const STATUS_FILE = path.join(__dirname, 'status.json');
 const RESULTS_FILE = path.join(__dirname, 'results.json');
 const ID_COUNTER_FILE = path.join(__dirname, 'task_id_counter.json');
-const RUNTIME_CONFIG_FILE = path.join(__dirname, 'runtime_config.json');
-const DEFAULT_RUNTIME_CONFIG = {
-  JOB_FILTER_MODE: 'general_pm',
-  EXPERIENCE: '103',
-  MAX_LIST_PAGES_PER_RUN: 3,
-  MAX_LIST_PAGE_SIZE: 30,
-  MAX_DETAIL_REQUESTS_PER_RUN: 3,
-  EXP_HARD_EXCLUDE_SOURCE: '10年以上',
-  deliveryEnabled: false
-};
 const DELIVERY_ALERT_WINDOW_MS = 30 * 60 * 1000;
 
 // 城市代码映射（字符串城市名 -> {code, name}）
@@ -168,43 +175,6 @@ function writeJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
-function sanitizeRuntimeConfig(config = {}) {
-  const next = { ...DEFAULT_RUNTIME_CONFIG };
-
-  if (typeof config.JOB_FILTER_MODE === 'string' && ['ai_focused', 'general_pm'].includes(config.JOB_FILTER_MODE)) {
-    next.JOB_FILTER_MODE = config.JOB_FILTER_MODE;
-  }
-
-  if (typeof config.EXPERIENCE === 'string' && config.EXPERIENCE.trim()) {
-    next.EXPERIENCE = config.EXPERIENCE.trim();
-  }
-
-  const maxPages = Number(config.MAX_LIST_PAGES_PER_RUN);
-  if (Number.isInteger(maxPages) && maxPages >= 1 && maxPages <= 10) {
-    next.MAX_LIST_PAGES_PER_RUN = maxPages;
-  }
-
-  const maxPageSize = Number(config.MAX_LIST_PAGE_SIZE);
-  if (Number.isInteger(maxPageSize) && maxPageSize >= 1 && maxPageSize <= 30) {
-    next.MAX_LIST_PAGE_SIZE = maxPageSize;
-  }
-
-  const maxDetails = Number(config.MAX_DETAIL_REQUESTS_PER_RUN);
-  if (Number.isInteger(maxDetails) && maxDetails >= 1 && maxDetails <= 20) {
-    next.MAX_DETAIL_REQUESTS_PER_RUN = maxDetails;
-  }
-
-  if (typeof config.EXP_HARD_EXCLUDE_SOURCE === 'string' && config.EXP_HARD_EXCLUDE_SOURCE.trim()) {
-    next.EXP_HARD_EXCLUDE_SOURCE = config.EXP_HARD_EXCLUDE_SOURCE.trim();
-  }
-
-  if (typeof config.deliveryEnabled === 'boolean') {
-    next.deliveryEnabled = config.deliveryEnabled;
-  }
-
-  return next;
-}
-
 function appendResultEntry(entry) {
   const results = readJSON(RESULTS_FILE, []);
   results.push(entry);
@@ -214,18 +184,25 @@ function appendResultEntry(entry) {
   writeJSON(RESULTS_FILE, results);
 }
 
-function readRuntimeConfig() {
-  const runtimeConfig = sanitizeRuntimeConfig(readJSON(RUNTIME_CONFIG_FILE, DEFAULT_RUNTIME_CONFIG));
-  writeJSON(RUNTIME_CONFIG_FILE, runtimeConfig);
-  return runtimeConfig;
-}
+function syncBackgroundWorkers(runtimeConfig) {
+  companyEnrichmentWorker.start();
 
-function syncDeliveryWorker(runtimeConfig) {
   if (runtimeConfig.deliveryEnabled) {
     deliveryWorker.start();
   } else {
     deliveryWorker.stop();
   }
+}
+
+function triggerBackgroundProcessing(runtimeConfig, reason) {
+  companyEnrichmentWorker.processPendingRecords().then(() => {
+    if (runtimeConfig.deliveryEnabled) {
+      return deliveryWorker.processPendingRecords();
+    }
+    return null;
+  }).catch((error) => {
+    console.error(`[CrawlController] Background processing trigger failed (${reason}): ${error.message}`);
+  });
 }
 
 function buildDeliveryAlertSignature(alert) {
@@ -304,15 +281,21 @@ function checkDeliveryAlerts() {
   return alerts;
 }
 
-// CORS 头
-function setCORS(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+// CORS 白名单正则（Q13 决策）
+const ALLOWED_ORIGIN_RE = /^(chrome-extension:\/\/[a-z0-9]{32}|https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?)/;
+
+// CORS 头（动态白名单）
+function setCORS(req, res) {
+  const origin = req.headers.origin || '';
+  if (ALLOWED_ORIGIN_RE.test(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
 }
 
-const server = http.createServer((req, res) => {
-  setCORS(res);
+const server = http.createServer(async (req, res) => {
+  setCORS(req, res);
   res.setHeader('Content-Type', 'application/json');
 
   // 处理 OPTIONS 预检请求
@@ -334,6 +317,42 @@ const server = http.createServer((req, res) => {
       defaultTarget,
       targets
     }));
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/feishu/option-dict') {
+    const requestedTarget = normalizeDeliveryTarget(url.searchParams.get('target'));
+    const targetName = requestedTarget && targetExists(requestedTarget)
+      ? requestedTarget
+      : (listTargets().find((item) => item.isDefault)?.name || null);
+
+    if (!targetName) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ success: false, error: 'No Feishu target configured' }));
+      return;
+    }
+
+    try {
+      const fields = await fetchFieldDefinitions(targetName);
+      const optionDict = {};
+      for (const field of fields) {
+        if (field.property?.options) {
+          optionDict[field.field_name] = field.property.options.map((option) => option.name);
+        }
+      }
+
+      res.end(JSON.stringify({
+        success: true,
+        target: targetName,
+        optionDict
+      }));
+    } catch (error) {
+      res.writeHead(500);
+      res.end(JSON.stringify({
+        success: false,
+        error: error.message
+      }));
+    }
     return;
   }
 
@@ -510,12 +529,13 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/runtime-config') {
     const runtimeConfig = readRuntimeConfig();
-    syncDeliveryWorker(runtimeConfig);
+    syncBackgroundWorkers(runtimeConfig);
     res.end(JSON.stringify({
       success: true,
       runtimeConfig,
       deliveryEnabled: runtimeConfig.deliveryEnabled,
       workerEnabled: deliveryWorker.isStarted(),
+      enrichmentWorkerEnabled: companyEnrichmentWorker.isStarted(),
       configFile: RUNTIME_CONFIG_FILE
     }));
     return;
@@ -529,13 +549,14 @@ const server = http.createServer((req, res) => {
         const payload = body ? JSON.parse(body) : {};
         const runtimeConfig = sanitizeRuntimeConfig(payload);
         writeJSON(RUNTIME_CONFIG_FILE, runtimeConfig);
-        syncDeliveryWorker(runtimeConfig);
+        syncBackgroundWorkers(runtimeConfig);
         console.log(`[CrawlController] Runtime config updated: ${JSON.stringify(runtimeConfig)}`);
         res.end(JSON.stringify({
           success: true,
           runtimeConfig,
           deliveryEnabled: runtimeConfig.deliveryEnabled,
           workerEnabled: deliveryWorker.isStarted(),
+          enrichmentWorkerEnabled: companyEnrichmentWorker.isStarted(),
           configFile: RUNTIME_CONFIG_FILE
         }));
       } catch (e) {
@@ -707,6 +728,15 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname === '/company-enrichment/stats') {
+    res.end(JSON.stringify({
+      success: true,
+      stats: fetchCompanyEnrichmentStats(),
+      workerEnabled: companyEnrichmentWorker.isStarted()
+    }));
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/delivery/records') {
     const status = url.searchParams.get('status');
     const limit = url.searchParams.get('limit');
@@ -776,6 +806,9 @@ const server = http.createServer((req, res) => {
         }
 
         checkDeliveryAlerts();
+        if (inserted > 0) {
+          triggerBackgroundProcessing(readRuntimeConfig(), 'report-detail');
+        }
 
         res.end(JSON.stringify({
           success: true,
@@ -817,7 +850,8 @@ const server = http.createServer((req, res) => {
             t.status !== 'completed'
           );
 
-          if (idx < 0) {
+          const isManualReportTask = typeof reportTaskId === 'string' && reportTaskId.startsWith('manual-');
+          if (idx < 0 && !isManualReportTask) {
             res.writeHead(404);
             res.end(JSON.stringify({
               error: `Task not found or already completed for taskId ${reportTaskId}`,
@@ -826,54 +860,58 @@ const server = http.createServer((req, res) => {
             return;
           }
 
-          // P0修复：完整状态机映射 success / anti_crawl / failed / 未知兜底
-          if (report.status === 'success') {
-            queue[idx].status = 'completed';
-            queue[idx].completedAt = Date.now();
-          } else if (report.status === 'anti_crawl') {
-            // 反爬阻断：标记为 blocked_retry，下次可重新领取
-            queue[idx].status = 'blocked_retry';
-            queue[idx].blockedAt = Date.now();
-            queue[idx].failReason = report.errorCode || 'anti_crawl';
-            console.log(`[CrawlController] Task blocked (anti_crawl), will retry: ${queue[idx].keyword} in ${queue[idx].city.name || queue[idx].city}`);
-          } else if (report.status === 'failed') {
-            // 执行失败
-            queue[idx].status = 'failed';
-            queue[idx].failedAt = Date.now();
-            queue[idx].failReason = report.errorMessage || 'unknown';
-            console.log(`[CrawlController] Task failed: ${queue[idx].keyword} in ${queue[idx].city.name || queue[idx].city}, reason: ${queue[idx].failReason}`);
+          if (idx >= 0) {
+            // P0修复：完整状态机映射 success / anti_crawl / failed / 未知兜底
+            if (report.status === 'success') {
+              queue[idx].status = 'completed';
+              queue[idx].completedAt = Date.now();
+            } else if (report.status === 'anti_crawl') {
+              // 反爬阻断：标记为 blocked_retry，下次可重新领取
+              queue[idx].status = 'blocked_retry';
+              queue[idx].blockedAt = Date.now();
+              queue[idx].failReason = report.errorCode || 'anti_crawl';
+              console.log(`[CrawlController] Task blocked (anti_crawl), will retry: ${queue[idx].keyword} in ${queue[idx].city.name || queue[idx].city}`);
+            } else if (report.status === 'failed') {
+              // 执行失败
+              queue[idx].status = 'failed';
+              queue[idx].failedAt = Date.now();
+              queue[idx].failReason = report.errorMessage || 'unknown';
+              console.log(`[CrawlController] Task failed: ${queue[idx].keyword} in ${queue[idx].city.name || queue[idx].city}, reason: ${queue[idx].failReason}`);
+            } else {
+              // 未知状态兜底 → failed（不再 silent completed）
+              queue[idx].status = 'failed';
+              queue[idx].failedAt = Date.now();
+              queue[idx].failReason = `unknown_report_status: ${report.status}`;
+              console.warn(`[CrawlController] Unknown report status: ${report.status}, marking as failed`);
+            }
+            // 保留完整结果
+            queue[idx].result = {
+              taskId: reportTaskId,
+              status: report.status,
+              codeVersion: report.codeVersion || queue[idx].codeVersion || null,
+              pipelineVersion: report.pipelineVersion || queue[idx].pipelineVersion || null,
+              total: report.total || 0,
+              withDescription: report.withDescription || 0,
+              pushed: report.pushed || 0,
+              filtered: report.filtered || 0,
+              errorCode: report.errorCode || null,
+              errorMessage: report.errorMessage || null,
+              crawlState: report.crawlState || null,
+              listCount: report.listCount || 0,
+              pagesFetched: report.pagesFetched || 0,
+              missingEncryptJobIdCount: report.missingEncryptJobIdCount || 0,
+              detailSkippedSeenCount: report.detailSkippedSeenCount || 0,
+              detailRequestedCount: report.detailRequestedCount || 0,
+              detailSuccessCount: report.detailSuccessCount || 0,
+              detailDescriptionNonEmptyCount: report.detailDescriptionNonEmptyCount || 0,
+              filterReasonStats: report.filterReasonStats || null
+            };
+            queue[idx].codeVersion = report.codeVersion || queue[idx].codeVersion || null;
+            queue[idx].pipelineVersion = report.pipelineVersion || queue[idx].pipelineVersion || null;
+            writeJSON(QUEUE_FILE, queue);
           } else {
-            // 未知状态兜底 → failed（不再 silent completed）
-            queue[idx].status = 'failed';
-            queue[idx].failedAt = Date.now();
-            queue[idx].failReason = `unknown_report_status: ${report.status}`;
-            console.warn(`[CrawlController] Unknown report status: ${report.status}, marking as failed`);
+            console.log(`[CrawlController] Manual report accepted: ${reportTaskId}`);
           }
-          // 保留完整结果
-          queue[idx].result = {
-            taskId: reportTaskId,
-            status: report.status,
-            codeVersion: report.codeVersion || queue[idx].codeVersion || null,
-            pipelineVersion: report.pipelineVersion || queue[idx].pipelineVersion || null,
-            total: report.total || 0,
-            withDescription: report.withDescription || 0,
-            pushed: report.pushed || 0,
-            filtered: report.filtered || 0,
-            errorCode: report.errorCode || null,
-            errorMessage: report.errorMessage || null,
-            crawlState: report.crawlState || null,
-            listCount: report.listCount || 0,
-            pagesFetched: report.pagesFetched || 0,
-            missingEncryptJobIdCount: report.missingEncryptJobIdCount || 0,
-            detailSkippedSeenCount: report.detailSkippedSeenCount || 0,
-            detailRequestedCount: report.detailRequestedCount || 0,
-            detailSuccessCount: report.detailSuccessCount || 0,
-            detailDescriptionNonEmptyCount: report.detailDescriptionNonEmptyCount || 0,
-            filterReasonStats: report.filterReasonStats || null
-          };
-          queue[idx].codeVersion = report.codeVersion || queue[idx].codeVersion || null;
-          queue[idx].pipelineVersion = report.pipelineVersion || queue[idx].pipelineVersion || null;
-          writeJSON(QUEUE_FILE, queue);
         }
 
         appendResultEntry({
@@ -891,6 +929,220 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: 'Invalid JSON' }));
       }
     });
+    return;
+  }
+
+  // === Dashboard API (M1-N2) ===
+
+  if (url.pathname === '/api/jobs' && req.method === 'GET') {
+    jobsHandler.handleGetJobs(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/jobs/detail' && req.method === 'GET') {
+    jobsHandler.handleGetJobDetail(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/jobs/select' && req.method === 'POST') {
+    jobsHandler.handleSelectJob(req, res);
+    return;
+  }
+
+  if (url.pathname.match(/^\/api\/jobs\/\d+\/favorite$/) && req.method === 'POST') {
+    jobsHandler.handleToggleFavorite(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/jobs/clear' && req.method === 'POST') {
+    jobsHandler.handleClearAllJobs(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/delivery/selected' && req.method === 'GET') {
+    jobsHandler.handleGetDeliveryList(req, res);
+    return;
+  }
+
+  // POST /api/jobs/batch-insert - 批量写入 scraped_jobs 表（51job 等多平台入库）
+  if (url.pathname === '/api/jobs/batch-insert' && req.method === 'POST') {
+    jobsHandler.handleBatchInsert(req, res);
+    return;
+  }
+
+  // GET /api/jobs/detail-backlog - 查询待补详情的 backlog 队列
+  if (url.pathname === '/api/jobs/detail-backlog' && req.method === 'GET') {
+    jobsHandler.handleGetDetailBacklog(req, res);
+    return;
+  }
+
+  // POST /api/jobs/detail-status-update - 按 platform+platformJobId 更新 detail_status
+  if (url.pathname === '/api/jobs/detail-status-update' && req.method === 'POST') {
+    jobsHandler.handleDetailStatusUpdate(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/resume/upload' && req.method === 'POST') {
+    resumeHandler.handleResumeUpload(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/resume' && req.method === 'GET') {
+    resumeHandler.handleGetResume(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/resume' && req.method === 'DELETE') {
+    resumeHandler.handleDeleteResume(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/resume' && req.method === 'PATCH') {
+    resumeHandler.handlePatchResume(req, res);
+    return;
+  }
+
+  // POST /api/resume/export-pdf - 导出简历为 PDF（M9-N1-WP3）
+  if (url.pathname === '/api/resume/export-pdf' && req.method === 'POST') {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', async () => {
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString());
+
+        if (!body.content_md) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Missing content_md field' }));
+          return;
+        }
+
+        const pdfBuffer = await exportPDF(body.content_md);
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', 'attachment; filename="resume.pdf"');
+        res.setHeader('Content-Length', pdfBuffer.length);
+        res.writeHead(200);
+        res.end(pdfBuffer);
+      } catch (err) {
+        console.error('[CrawlController] PDF export failed:', err.message);
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: 'PDF generation failed: ' + err.message }));
+      }
+    });
+    return;
+  }
+
+  // === AI 配置管理 (M8-N1-WP3) ===
+
+  if (url.pathname === '/api/ai/config' && req.method === 'GET') {
+    aiHandler.handleGetConfig(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/ai/config' && req.method === 'POST') {
+    aiHandler.handleSaveConfig(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/ai/optimize' && req.method === 'POST') {
+    aiHandler.handleOptimizeResume(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/ai/match' && req.method === 'POST') {
+    aiHandler.handleJobMatch(req, res);
+    return;
+  }
+
+  // === 页码任务 API (M14-N2-WP2) ===
+
+  // POST /api/page-tasks/create - 创建页码任务
+  if (url.pathname === '/api/page-tasks/create' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body);
+        const platform = payload.platform;
+        const city = payload.city;
+        const keyword = payload.keyword;
+        const pageNumber = Number(payload.pageNumber) || 1;
+
+        if (!platform || !city || !keyword) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ success: false, error: 'Missing platform, city, or keyword' }));
+          return;
+        }
+
+        const result = createPageTask(platform, city, keyword, pageNumber);
+        res.end(JSON.stringify({ success: true, ...result }));
+      } catch (e) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ success: false, error: 'Invalid JSON' }));
+      }
+    });
+    return;
+  }
+
+  // POST /api/page-tasks/update - 更新页码任务状态
+  if (url.pathname === '/api/page-tasks/update' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body);
+        const id = Number(payload.id);
+        const status = payload.status;
+
+        if (!id || !status) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ success: false, error: 'Missing id or status' }));
+          return;
+        }
+
+        const validStatuses = ['pending', 'running', 'done', 'failed'];
+        if (!validStatuses.includes(status)) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ success: false, error: `Invalid status: ${status}` }));
+          return;
+        }
+
+        const options = {};
+        if (payload.jobsFound !== undefined) options.jobsFound = Number(payload.jobsFound);
+        if (payload.jobsNew !== undefined) options.jobsNew = Number(payload.jobsNew);
+        if (payload.error !== undefined) options.error = String(payload.error);
+
+        const updated = updatePageTaskStatus(id, status, options);
+        if (!updated) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ success: false, error: 'Page task not found' }));
+          return;
+        }
+        res.end(JSON.stringify({ success: true, id, status }));
+      } catch (e) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ success: false, error: 'Invalid JSON' }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/page-tasks/pending - 查询待执行页码任务
+  if (url.pathname === '/api/page-tasks/pending' && req.method === 'GET') {
+    const platform = url.searchParams.get('platform') || undefined;
+    const city = url.searchParams.get('city') || undefined;
+    const keyword = url.searchParams.get('keyword') || undefined;
+    const limit = Number(url.searchParams.get('limit')) || 100;
+
+    const tasks = getPendingPageTasks(platform, city, keyword, limit);
+    res.end(JSON.stringify({ success: true, tasks }));
+    return;
+  }
+
+  // POST /api/page-tasks/reset-running - 断点恢复，重置 running -> pending
+  if (url.pathname === '/api/page-tasks/reset-running' && req.method === 'POST') {
+    const count = resetRunningPageTasks();
+    res.end(JSON.stringify({ success: true, resetCount: count }));
     return;
   }
 
@@ -926,6 +1178,7 @@ function startServer() {
     console.log(`[CrawlController] SQLite ready: ${DEFAULT_DB_PATH} (schema v${SCHEMA_VERSION})`);
     console.log(`[CrawlController] Feishu targets ready: ${getTargetsFilePath()}`);
     console.log(`[CrawlController] deliveryEnabled=${runtimeConfig.deliveryEnabled}`);
+    console.log(`[CrawlController] companyEnrichmentWorkerStarted=${companyEnrichmentWorker.isStarted()}`);
     console.log('[CrawlController] Available endpoints:');
     console.log('  POST /enqueue  - Add task: {"city":"北京","keyword":"AI产品经理","priority":"normal","source":"openclaw","batchId":"BATCH-20260321-01","deliveryTarget":"personal"}');
     console.log('  GET  /queue    - View queue');
@@ -940,18 +1193,24 @@ function startServer() {
     console.log('  GET  /results  - Get recent results');
     console.log('  GET  /delivery/stats - Get delivery queue stats');
     console.log('  GET  /delivery/records - Get delivery queue records');
+    console.log('  GET  /company-enrichment/stats - Get company enrichment stats');
     console.log('  POST /reset    - Reset all data (test)');
     console.log('  POST /seed     - Seed test data (test)');
     console.log('  GET  /export   - Export snapshot (test)');
     console.log('  POST /report-detail - Mirror detail payloads into SQLite');
     console.log('  POST /report   - Extension callback endpoint');
-    syncDeliveryWorker(runtimeConfig);
+    console.log('  POST /api/page-tasks/create - Create crawl page task');
+    console.log('  POST /api/page-tasks/update - Update page task status');
+    console.log('  GET  /api/page-tasks/pending - Get pending page tasks');
+    console.log('  POST /api/page-tasks/reset-running - Reset running page tasks');
+    syncBackgroundWorkers(runtimeConfig);
   });
 }
 
 // 优雅退出
 process.on('SIGINT', () => {
   console.log('\n[CrawlController] Shutting down...');
+  companyEnrichmentWorker.stop();
   deliveryWorker.stop();
   closeDatabase();
   server.close(() => {

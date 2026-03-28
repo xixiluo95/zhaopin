@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>招聘工作台</title>
+  <link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+  <nav id="main-nav">
+    <a href="#home" class="nav-tab active">首页</a>
+    <a href="#crawl" class="nav-tab">采集</a>
+    <a href="#resume" class="nav-tab">工作台</a>
+  </nav>
+  <div id="view-home"></div>
+  <div id="view-crawl" style="display:none">
+    <!-- M11-N2-WP1: 采集控制面板 -->
+    <div id="crawl-control-panel">
+      <h3 class="crawl-panel__title">采集控制</h3>
+      <div class="crawl-panel__body">
+        <div class="crawl-field">
+          <label>采集平台</label>
+          <select class="crawl-select" id="crawl-platform">
+            <option value="all">全部</option>
+            <option value="boss" selected>Boss直聘</option>
+            <option value="51job">前程无忧</option>
+            <option value="liepin" disabled>猎聘 (即将支持)</option>
+            <option value="zhaopin">智联招聘</option>
+          </select>
+        </div>
+        <div class="crawl-field">
+          <label>搜索关键词</label>
+          <input class="crawl-input" id="crawl-keyword" placeholder="前端开发、Java...">
+        </div>
+        <div class="crawl-field">
+          <label>城市</label>
+          <input class="crawl-input" id="crawl-city" placeholder="北京、上海、深圳...">
+        </div>
+        <div class="crawl-panel__actions">
+          <button class="res-btn res-btn--ai" id="crawl-start-btn">开始采集</button>
+          <button class="res-btn" id="crawl-stop-btn" disabled>停止采集</button>
+        </div>
+        <div class="crawl-status" id="crawl-status" style="display:none">
+          <div class="crawl-status__text" id="crawl-status-text"></div>
+          <div class="crawl-progress">
+            <div class="crawl-progress__bar" id="crawl-progress-bar" style="width:0%"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="verify-ov" id="verifyOverlay" style="display:none">
+    <div class="verify-panel">
+      <div class="verify-panel__title">需要人工验证</div>
+      <div class="verify-panel__body">
+        <div class="verify-panel__text" id="verifyText"></div>
+        <div class="verify-panel__hint" id="verifyHint">只有明确命中验证页时才会暂停，正常情况仍会自动采集。</div>
+        <div class="verify-panel__actions">
+          <button class="res-btn" id="verify-open-btn">去验证</button>
+          <button class="res-btn res-btn--ai" id="verify-confirm-btn">已验证</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 居中弹窗容器 -->
+  <div class="exov" id="exOverlay">
+    <div class="expanel">
+      <button class="exclose" id="exClose">&times;</button>
+      <div class="exbody" id="exBody"></div>
+    </div>
+  </div>
+  <div id="view-resume" style="display:none"></div>
+  <div class="split" id="splitView">
+    <div class="spane sp-l" id="splitLeft"></div>
+    <div class="spane sp-r" id="splitRight"></div>
+  </div>
+  <div id="toast-container"></div>
+  <script src="lib/docx.min.js"></script>
+  <script type="module" src="dashboard.js"></script>
+</body>
+</html>

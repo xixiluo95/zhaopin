@@ -61,6 +61,9 @@ const CONFIG = {
   // internal_only: 仅使用内置队列，忽略控制面
   TASK_SOURCE_MODE: 'controller_only',  // 验收/生产环境默认
 
+  // 扩展刷新后是否自动拉起采集（默认关闭，由 Dashboard 手动触发）
+  ENABLE_AUTO_BOOTSTRAP: false,
+
   // 规则过滤配置
   FILTER: {
     // 硬排除：明确的校招/实习性质词汇
@@ -93,18 +96,25 @@ const CONFIG = {
   // interval: 固定分钟间隔轮询，适合联调和无人值守验证
   ALARM_MODE: 'interval',
   ALARM_INTERVAL_MINUTES: 1,
-  ALARM_BOOTSTRAP_DELAY_MINUTES: 1
+  ALARM_BOOTSTRAP_DELAY_MINUTES: 1,
+  IDLE_POLL_INTERVAL_MINUTES: 5
 };
 
 const RUNTIME_CONFIG_DEFAULTS = {
-  EXPERIENCE: CONFIG.EXPERIENCE,
+  EXPERIENCE: '',
   JOB_FILTER_MODE: CONFIG.JOB_FILTER_MODE,
-  MAX_LIST_PAGES_PER_RUN: CONFIG.MAX_LIST_PAGES_PER_RUN,
+  MAX_LIST_PAGES_PER_RUN: 0,
   MAX_LIST_PAGE_SIZE: 30,
-  MAX_DETAIL_REQUESTS_PER_RUN: CONFIG.BATCH.MAX_DETAIL_REQUESTS_PER_RUN,
-  EXP_HARD_EXCLUDE_SOURCE: CONFIG.FILTER.EXP_HARD_EXCLUDE.source,
-  deliveryEnabled: false
+  MAX_DETAIL_REQUESTS_PER_RUN: 0,
+  EXP_HARD_EXCLUDE_SOURCE: '',
+  deliveryEnabled: false,
+  // 智联列表分页参数（可通过 runtime_config / popup 配置面板调整）
+  MAX_LIST_PAGES: 1,              // 单次任务最多翻 N 页（默认 1，即只抓 p1）
+  DETAIL_BUDGET_PER_RUN: 3,       // 单次任务详情预算
+  DETAIL_REQUEST_INTERVAL_MS: 3000 // 详情请求间隔（毫秒）
 };
+
+const MANUAL_ALARM_PAUSE_MS = 10 * 60 * 1000;
 
 // ============ 主服务 ============
 class JobHunterService {
@@ -116,12 +126,25 @@ class JobHunterService {
     this.isCooldown = false;       // 是否处于冷却期
     // 本次采集统计
     this.runStats = this.createEmptyRunStats();
+    this.manualAlarmPauseUntil = 0;
+    this.manualVerification = {
+      required: false,
+      platform: null,
+      platformLabel: '',
+      message: '',
+      validationTabId: null,
+      requestedAt: null
+    };
+    this.manualVerificationResolver = null;
+    this._51jobAreaCatalogPromise = null;
+    this.activeCrawlSession = this.createEmptyCrawlSession();
     // 反爬状态机（持久化）
     this.crawlState = {
       status: 'normal',           // normal | cooldown_1h | cooldown_4h | blocked_today
       blockedUntil: null,         // 统一字段：冷却/封禁截止时间戳
       consecutiveBatchFailures: 0, // 连续批次失败次数
-      lastAntiCrawlTime: null     // 上次触发反爬的时间
+      lastAntiCrawlTime: null,    // 上次触发反爬的时间
+      source: null                // 当前采集来源: 'manual' | 'auto' | null
     };
     // 队列长度历史（用于检测堆积）- 从 storage 加载或初始化为空
     this.queueLengthHistory = [];
@@ -162,6 +185,30 @@ class JobHunterService {
     };
   }
 
+  createEmptyCrawlSession() {
+    return {
+      isActive: false,
+      platform: null,
+      crawlBatchId: null,
+      keyword: '',
+      city: '',
+      groupSize: 20,
+      startedAt: null,
+      endedAt: null
+    };
+  }
+
+  setActiveCrawlSession(nextState = {}) {
+    this.activeCrawlSession = {
+      ...this.activeCrawlSession,
+      ...nextState
+    };
+  }
+
+  clearActiveCrawlSession() {
+    this.activeCrawlSession = this.createEmptyCrawlSession();
+  }
+
   getVersionInfo() {
     return {
       codeVersion: CODE_VERSION,
@@ -179,12 +226,12 @@ class JobHunterService {
       next.JOB_FILTER_MODE = config.JOB_FILTER_MODE;
     }
 
-    if (typeof config.EXPERIENCE === 'string' && config.EXPERIENCE.trim()) {
+    if (typeof config.EXPERIENCE === 'string') {
       next.EXPERIENCE = config.EXPERIENCE.trim();
     }
 
     const maxPages = Number(config.MAX_LIST_PAGES_PER_RUN);
-    if (Number.isInteger(maxPages) && maxPages >= 1 && maxPages <= 10) {
+    if (Number.isInteger(maxPages) && maxPages >= 0) {
       next.MAX_LIST_PAGES_PER_RUN = maxPages;
     }
 
@@ -194,16 +241,32 @@ class JobHunterService {
     }
 
     const maxDetails = Number(config.MAX_DETAIL_REQUESTS_PER_RUN);
-    if (Number.isInteger(maxDetails) && maxDetails >= 1 && maxDetails <= 20) {
+    if (Number.isInteger(maxDetails) && maxDetails >= 0) {
       next.MAX_DETAIL_REQUESTS_PER_RUN = maxDetails;
     }
 
-    if (typeof config.EXP_HARD_EXCLUDE_SOURCE === 'string' && config.EXP_HARD_EXCLUDE_SOURCE.trim()) {
+    if (typeof config.EXP_HARD_EXCLUDE_SOURCE === 'string') {
       next.EXP_HARD_EXCLUDE_SOURCE = config.EXP_HARD_EXCLUDE_SOURCE.trim();
     }
 
     if (typeof config.deliveryEnabled === 'boolean') {
       next.deliveryEnabled = config.deliveryEnabled;
+    }
+
+    // 智联列表分页参数
+    const maxListPages = Number(config.MAX_LIST_PAGES);
+    if (Number.isInteger(maxListPages) && maxListPages >= 1) {
+      next.MAX_LIST_PAGES = maxListPages;
+    }
+
+    const detailBudget = Number(config.DETAIL_BUDGET_PER_RUN);
+    if (Number.isInteger(detailBudget) && detailBudget >= 0) {
+      next.DETAIL_BUDGET_PER_RUN = detailBudget;
+    }
+
+    const detailInterval = Number(config.DETAIL_REQUEST_INTERVAL_MS);
+    if (Number.isInteger(detailInterval) && detailInterval >= 500) {
+      next.DETAIL_REQUEST_INTERVAL_MS = detailInterval;
     }
 
     return next;
@@ -238,7 +301,9 @@ class JobHunterService {
   }
 
   getMaxListPagesPerRun() {
-    return this.runtimeConfig.MAX_LIST_PAGES_PER_RUN || RUNTIME_CONFIG_DEFAULTS.MAX_LIST_PAGES_PER_RUN;
+    return Number.isInteger(this.runtimeConfig.MAX_LIST_PAGES_PER_RUN)
+      ? this.runtimeConfig.MAX_LIST_PAGES_PER_RUN
+      : RUNTIME_CONFIG_DEFAULTS.MAX_LIST_PAGES_PER_RUN;
   }
 
   getMaxListPageSize() {
@@ -246,11 +311,34 @@ class JobHunterService {
   }
 
   getMaxDetailRequestsPerRun() {
-    return this.runtimeConfig.MAX_DETAIL_REQUESTS_PER_RUN || RUNTIME_CONFIG_DEFAULTS.MAX_DETAIL_REQUESTS_PER_RUN;
+    return Number.isInteger(this.runtimeConfig.MAX_DETAIL_REQUESTS_PER_RUN)
+      ? this.runtimeConfig.MAX_DETAIL_REQUESTS_PER_RUN
+      : RUNTIME_CONFIG_DEFAULTS.MAX_DETAIL_REQUESTS_PER_RUN;
+  }
+
+  // 智联分页配置访问器
+  getMaxListPages() {
+    return Number.isInteger(this.runtimeConfig.MAX_LIST_PAGES) && this.runtimeConfig.MAX_LIST_PAGES >= 1
+      ? this.runtimeConfig.MAX_LIST_PAGES
+      : RUNTIME_CONFIG_DEFAULTS.MAX_LIST_PAGES;
+  }
+
+  getDetailBudgetPerRun() {
+    return Number.isInteger(this.runtimeConfig.DETAIL_BUDGET_PER_RUN) && this.runtimeConfig.DETAIL_BUDGET_PER_RUN >= 0
+      ? this.runtimeConfig.DETAIL_BUDGET_PER_RUN
+      : RUNTIME_CONFIG_DEFAULTS.DETAIL_BUDGET_PER_RUN;
+  }
+
+  getDetailRequestIntervalMs() {
+    return Number.isInteger(this.runtimeConfig.DETAIL_REQUEST_INTERVAL_MS) && this.runtimeConfig.DETAIL_REQUEST_INTERVAL_MS >= 500
+      ? this.runtimeConfig.DETAIL_REQUEST_INTERVAL_MS
+      : RUNTIME_CONFIG_DEFAULTS.DETAIL_REQUEST_INTERVAL_MS;
   }
 
   getExperienceCode() {
-    return this.runtimeConfig.EXPERIENCE || RUNTIME_CONFIG_DEFAULTS.EXPERIENCE;
+    return typeof this.runtimeConfig.EXPERIENCE === 'string'
+      ? this.runtimeConfig.EXPERIENCE
+      : RUNTIME_CONFIG_DEFAULTS.EXPERIENCE;
   }
 
   isControllerDeliveryEnabled() {
@@ -258,10 +346,10 @@ class JobHunterService {
   }
 
   getExpHardExcludeRegex() {
-    return new RegExp(
-      this.runtimeConfig.EXP_HARD_EXCLUDE_SOURCE || RUNTIME_CONFIG_DEFAULTS.EXP_HARD_EXCLUDE_SOURCE,
-      'i'
-    );
+    const source = typeof this.runtimeConfig.EXP_HARD_EXCLUDE_SOURCE === 'string'
+      ? this.runtimeConfig.EXP_HARD_EXCLUDE_SOURCE
+      : RUNTIME_CONFIG_DEFAULTS.EXP_HARD_EXCLUDE_SOURCE;
+    return source ? new RegExp(source, 'i') : null;
   }
 
   async syncRuntimeConfigFromController() {
@@ -330,6 +418,12 @@ class JobHunterService {
 
     console.log(`[JobHunter] Alarm triggered: ${alarm.name}`);
 
+    if (Date.now() < this.manualAlarmPauseUntil) {
+      const remainingMinutes = Math.ceil((this.manualAlarmPauseUntil - Date.now()) / 60000);
+      console.log(`[JobHunter] Alarm ${alarm.name} skipped due to recent manual run (${remainingMinutes}min remaining)`);
+      return;
+    }
+
     // 检查 crawl_state
     const blockCheck = await this.checkBlocked();
     if (blockCheck.blocked) {
@@ -353,9 +447,36 @@ class JobHunterService {
     }
   }
 
+  async enterIdlePolling(reason = 'idle') {
+    await chrome.alarms.clearAll();
+    const idleMinutes = Math.max(1, CONFIG.IDLE_POLL_INTERVAL_MINUTES);
+    chrome.alarms.create('crawl_bootstrap', {
+      delayInMinutes: idleMinutes
+    });
+    console.log(`[JobHunter] Enter idle polling (${reason}), next wake in ${idleMinutes}min`);
+  }
+
   // 恢复/注册 alarms
   async restoreAlarms() {
     await chrome.alarms.clearAll();
+
+    if (CONFIG.TASK_SOURCE_MODE === 'controller_only') {
+      if (!CONFIG.ENABLE_AUTO_BOOTSTRAP) {
+        console.log('[JobHunter] auto bootstrap disabled, skip crawl_bootstrap alarm');
+        return;
+      }
+      chrome.alarms.create('crawl_bootstrap', {
+        delayInMinutes: Math.max(1, CONFIG.ALARM_BOOTSTRAP_DELAY_MINUTES)
+      });
+      console.log(`[JobHunter] controller_only bootstrap scheduled in ${Math.max(1, CONFIG.ALARM_BOOTSTRAP_DELAY_MINUTES)}min`);
+      const alarms = await chrome.alarms.getAll();
+      console.log('[JobHunter] Alarms restored:', alarms.map(alarm => ({
+        name: alarm.name,
+        scheduledTime: alarm.scheduledTime ? new Date(alarm.scheduledTime).toISOString() : null,
+        periodInMinutes: alarm.periodInMinutes || null
+      })));
+      return;
+    }
 
     const alarmNames = ['crawl_morning', 'crawl_afternoon', 'crawl_evening', 'crawl_retry'];
     for (const name of alarmNames) {
@@ -426,8 +547,154 @@ class JobHunterService {
             sendResponse({ success: false, error: 'Already running' });
             return;
           }
-          const results = await this.executeCrawlTask();
-          sendResponse({ success: true, data: results });
+          // 记录 dashboard 传入的参数（当前采集由队列驱动，payload 仅供参考）
+          if (request.payload) {
+            console.log('[JobHunter] Dashboard payload:', request.payload);
+          }
+          // 根据请求的平台选择采集流程（Dashboard 通过 payload.platform 传入）
+          const requestPlatform = request.payload?.platform || request.platform || 'boss';
+          if (requestPlatform === 'all') {
+            // 全平台串行采集：boss → 51job → liepin → zhaopin（依次执行，汇总结果）
+            const ALL_PLATFORMS = ['boss', '51job', 'liepin', 'zhaopin'];
+            // 平台显示名称映射
+            const PLATFORM_LABELS = {
+              boss: 'Boss直聘', '51job': '前程无忧', liepin: '猎聘', zhaopin: '智联招聘'
+            };
+            console.log('[JobHunter] 启动全平台串行采集:', ALL_PLATFORMS.map(p => PLATFORM_LABELS[p] || p));
+            this.isRunning = true;
+            this.crawlState.status = 'running';
+
+            const byPlatform = {};
+            let totalJobs = 0;
+            let totalWithDesc = 0;
+            const errors = [];
+            let stoppedEarly = false;
+
+            for (const platform of ALL_PLATFORMS) {
+              // 每轮开始前检查停止标志
+              if (!this.isRunning) {
+                console.log(`[JobHunter] 全平台采集被用户停止，跳过剩余平台（已完成: ${Object.keys(byPlatform).join(', ')}）`);
+                stoppedEarly = true;
+                break;
+              }
+              const label = PLATFORM_LABELS[platform] || platform;
+              console.log(`[JobHunter] [全平台 ${Object.keys(byPlatform).length + 1}/${ALL_PLATFORMS.length}] 开始采集: ${label} (${platform})`);
+              try {
+                let result;
+                if (platform === 'boss') {
+                  // boss 走原有 executeCrawlTask 逻辑（内部会设 isRunning=false）
+                  result = await this.executeCrawlTask(null);
+                } else if (platform === '51job') {
+                  this.isRunning = true; // 重新启用，供下一轮循环检查
+                  result = await this.execute51JobCrawl();
+                } else if (platform === 'liepin') {
+                  this.isRunning = true;
+                  // 猎聘尚未实现采集器，跳过并记录
+                  console.warn(`[JobHunter] ${label} 采集器尚未实现，跳过`);
+                  byPlatform[platform] = { total: 0, withDescription: 0, skipped: true, reason: 'not_implemented' };
+                  continue;
+                } else if (platform === 'zhaopin') {
+                  this.isRunning = true;
+                  result = await this.executeZhaopinCrawl();
+                }
+
+                const platformTotal = result?.success ? (result.totalJobs ?? result.total ?? 0) : 0;
+                const platformWithDesc = result?.withDescription ?? 0;
+                byPlatform[platform] = { total: platformTotal, withDescription: platformWithDesc };
+                totalJobs += platformTotal;
+                totalWithDesc += platformWithDesc;
+                console.log(`[JobHunter] ${label} 采集完成: ${platformTotal} 条`);
+              } catch (err) {
+                console.warn(`[JobHunter] ${label} 采集异常:`, err.message);
+                errors.push({ platform, error: err.message });
+                byPlatform[platform] = { total: 0, withDescription: 0, error: err.message };
+                // 单平台失败不中断，继续下一个平台
+              }
+            }
+
+            this.isRunning = false;
+            this.crawlState.status = 'completed';
+            const allResult = {
+              success: true,
+              platform: 'all',
+              total: totalJobs,
+              totalJobs,
+              withDescription: totalWithDesc,
+              totalWithDescription: totalWithDesc,
+              byPlatform,
+              errors: errors.length > 0 ? errors : undefined,
+              stoppedEarly
+            };
+            console.log('[JobHunter] 全平台采集完成:', JSON.stringify(byPlatform));
+            sendResponse({ success: true, data: allResult });
+          } else if (requestPlatform === '51job') {
+            // 51job 专用采集流程（DOM解析模式）
+            console.log('[JobHunter] 启动 51job 采集流程');
+            this.isRunning = true;
+            this.crawlState.status = 'running';
+            const result51 = await this.execute51JobCrawl(request.payload || {});
+
+            // 51job 分页采集已在内部逐页调用 reportJobsToController 入库，无需外部重复
+
+            this.isRunning = false;
+            this.crawlState.status = 'completed';
+            sendResponse({ success: true, data: result51 });
+          } else if (requestPlatform === 'zhaopin') {
+            // 智联招聘专用采集流程
+            console.log('[JobHunter] 启动智联招聘采集流程');
+            this.isRunning = true;
+            this.crawlState.status = 'running';
+            const resultZhaopin = await this.executeZhaopinCrawl(request.payload || {});
+
+            // 智联分页采集已在内部逐页调用 reportJobsToController 入库，无需外部重复
+
+            this.isRunning = false;
+            this.crawlState.status = 'completed';
+            sendResponse({ success: true, data: resultZhaopin });
+          } else {
+            let manualTask = null;
+            if (request.payload?.keyword) {
+              const cityName = (request.payload.city || '北京').trim() || '北京';
+              const city =
+                CONFIG.CITIES.find((item) => item.name === cityName) ||
+                CONFIG.CITIES.find((item) => item.name.includes(cityName) || cityName.includes(item.name)) ||
+                CONFIG.CITIES[0];
+              manualTask = {
+                city: {
+                  name: cityName,
+                  code: city?.code || CONFIG.CITIES[0].code
+                },
+                keyword: request.payload.keyword.trim(),
+                taskId: `manual-${Date.now()}`,
+                source: 'manual'
+              };
+              this.manualAlarmPauseUntil = Date.now() + MANUAL_ALARM_PAUSE_MS;
+              console.log('[JobHunter] Dashboard manual task injected:', manualTask);
+              console.log(`[JobHunter] Auto alarms paused for ${Math.ceil(MANUAL_ALARM_PAUSE_MS / 60000)}min due to manual run`);
+            }
+            const results = await this.executeCrawlTask(manualTask);
+            if (results && results.success === false) {
+              sendResponse({
+                success: false,
+                error: results.error || 'Crawl failed',
+                data: results
+              });
+            } else {
+              sendResponse({ success: true, data: results });
+            }
+          }
+          break;
+
+        case 'STOP_CRAWL':
+          if (!this.isRunning) {
+            sendResponse({ success: false, error: 'Not running' });
+          } else {
+            this.isRunning = false;
+            this.crawlState.status = 'stopped_by_user';
+            this.resolveManualVerification(false);
+            sendResponse({ success: true, message: 'Crawl stopped by user' });
+            console.log('[JobHunter] Crawl stopped by user via dashboard');
+          }
           break;
 
         case 'GET_STATUS':
@@ -436,9 +703,12 @@ class JobHunterService {
             data: {
               isRunning: this.isRunning,
               stats: this.runStats,
+              verification: this.getManualVerificationState(),
+              crawlSession: { ...this.activeCrawlSession },
               alarmMode: CONFIG.ALARM_MODE,
               alarmIntervalMinutes: CONFIG.ALARM_INTERVAL_MINUTES,
               runtimeConfig: this.getRuntimeConfig(),
+              crawlSource: this.crawlState.source,  // 当前采集来源: 'manual' | 'auto' | null
               ...this.getVersionInfo()
             }
           });
@@ -491,10 +761,37 @@ class JobHunterService {
           sendResponse({ success: true });
           break;
 
+        case 'CLEAR_SEEN_JOB_IDS':
+          await chrome.storage.local.remove(SEEN_JOB_IDS_KEY);
+          sendResponse({ success: true, cleared: true });
+          break;
+
         case 'CHECK_FEISHU':
           const feishuOk = await this.checkFeishuConnection();
           sendResponse({ success: feishuOk });
           break;
+
+        case 'OPEN_VERIFICATION_TAB': {
+          const opened = await this.focusManualVerificationTab();
+          sendResponse({ success: Boolean(opened), data: { opened } });
+          break;
+        }
+
+        case 'ACK_MANUAL_VERIFICATION':
+          this.resolveManualVerification(true);
+          sendResponse({ success: true });
+          break;
+
+        case 'CRAWL_RESULT': {
+          const { platform, data } = request;
+          if (scrapers[platform]) {
+            scrapers[platform](data);
+          } else {
+            console.warn('[路由] 未支持的平台:', platform);
+          }
+          sendResponse({ success: true });
+          break;
+        }
 
         default:
           sendResponse({ success: false, error: 'Unknown type' });
@@ -506,7 +803,7 @@ class JobHunterService {
   }
 
   // ============ 核心采集流程（批次调度版） ============
-  async executeCrawlTask() {
+  async executeCrawlTask(manualTask = null) {
     // 等待初始化完成（防止竞态：确保 queueLengthHistory 已加载）
     if (this.initPromise) {
       await this.initPromise;
@@ -519,16 +816,28 @@ class JobHunterService {
       return { success: false, error: 'Already running' };
     }
 
-    // 1. 检查反爬状态
+    // 1. 检查反爬状态（手动模式：绕过冷却窗口；自动模式：阻塞返回）
+    const isManualTask = !!manualTask;
     const blockCheck = await this.checkBlocked();
     if (blockCheck.blocked) {
-      console.log(`[JobHunter] Queue-stuck check suppressed during blocked window: ${this.crawlState.status}`);
-      return { 
-        success: false, 
-        error: `Blocked: ${this.crawlState.status}, remaining ${blockCheck.remaining}min`,
-        status: this.crawlState.status
-      };
+      if (isManualTask) {
+        // manual 模式正式配置：绕过反爬冷却窗口
+        console.warn(
+          `[JobHunter] Manual task bypassing blocked window (source=manual): status=${this.crawlState.status}, remaining=${blockCheck.remaining}min`
+        );
+      } else {
+        console.log(`[JobHunter] Queue-stuck check suppressed during blocked window: ${this.crawlState.status}`);
+        return {
+          success: false,
+          error: `Blocked: ${this.crawlState.status}, remaining ${blockCheck.remaining}min`,
+          status: this.crawlState.status
+        };
+      }
     }
+
+    // 记录采集来源到 crawlState
+    this.crawlState.source = isManualTask ? 'manual' : 'auto';
+    await this.saveCrawlState();
 
     this.isRunning = true;
     // 重置本次采集统计（含filteredCount）
@@ -547,53 +856,62 @@ class JobHunterService {
     }
 
     // 2. 获取下一个任务（根据TASK_SOURCE_MODE决定来源）
-    let task, remaining, fromController = false;
-    const controllerTask = await this.fetchQueueFromController();
-    if (controllerTask) {
-      // 控制面有任务
-      task = controllerTask;
-      remaining = '?';  // 控制面队列长度不直接可知
-      fromController = true;
-      console.log('[JobHunter] task source: controller');
-    } else if (CONFIG.TASK_SOURCE_MODE === 'controller_only') {
-      // P1：仅控制面模式 - 不可达或无任务时直接返回
-      this.isRunning = false;
-      // 判断是控制面不可达还是真的没任务
-      try {
-        const res = await fetch(`${CONFIG.CONTROLLER_BASE_URL}/status`);
-        if (res.ok) {
-          console.log('[JobHunter] controller_only: no task available, skip');
-        } else {
-          console.warn('[JobHunter] controller_only: controller responded with error, skip');
-        }
-      } catch {
-        console.warn('[JobHunter] controller_only: controller unreachable, skip');
-      }
-      return { success: true, total: 0, reason: 'controller_no_task' };
-    } else if (CONFIG.TASK_SOURCE_MODE === 'internal_only') {
-      // P1：仅内置队列模式
-      const nextTask = await this.getNextTask();
-      task = nextTask.task;
-      remaining = nextTask.remaining;
-      fromController = false;
-      console.log('[JobHunter] task source: internal');
-      if (!task) {
-        this.isRunning = false;
-        console.log('[JobHunter] No pending tasks, queue empty');
-        return { success: true, total: 0, reason: 'queue_empty' };
-      }
+    let task;
+    let remaining;
+    let fromController = false;
+    if (isManualTask) {
+      task = manualTask;
+      remaining = 'manual';
+      console.log('[JobHunter] task source: manual');
     } else {
-      // P1：hybrid模式 - 优先控制面，回退内置队列（旧行为）
-      console.log('[JobHunter] controller unavailable, fallback to internal queue (hybrid mode)');
-      const nextTask = await this.getNextTask();
-      task = nextTask.task;
-      remaining = nextTask.remaining;
-      fromController = false;
-      console.log('[JobHunter] task source: internal (fallback)');
-      if (!task) {
+      const controllerTask = await this.fetchQueueFromController();
+      if (controllerTask) {
+        // 控制面有任务
+        task = controllerTask;
+        remaining = '?';  // 控制面队列长度不直接可知
+        fromController = true;
+        console.log('[JobHunter] task source: controller');
+      } else if (CONFIG.TASK_SOURCE_MODE === 'controller_only') {
+        // P1：仅控制面模式 - 不可达或无任务时直接返回
         this.isRunning = false;
-        console.log('[JobHunter] No pending tasks, queue empty');
-        return { success: true, total: 0, reason: 'queue_empty' };
+        // 判断是控制面不可达还是真的没任务
+        try {
+          const res = await fetch(`${CONFIG.CONTROLLER_BASE_URL}/status`);
+          if (res.ok) {
+            console.log('[JobHunter] controller_only: no task available, skip');
+            await this.enterIdlePolling('controller_no_task');
+          } else {
+            console.warn('[JobHunter] controller_only: controller responded with error, skip');
+          }
+        } catch {
+          console.warn('[JobHunter] controller_only: controller unreachable, skip');
+        }
+        return { success: true, total: 0, reason: 'controller_no_task' };
+      } else if (CONFIG.TASK_SOURCE_MODE === 'internal_only') {
+        // P1：仅内置队列模式
+        const nextTask = await this.getNextTask();
+        task = nextTask.task;
+        remaining = nextTask.remaining;
+        fromController = false;
+        console.log('[JobHunter] task source: internal');
+        if (!task) {
+          this.isRunning = false;
+          console.log('[JobHunter] No pending tasks, queue empty');
+          return { success: true, total: 0, reason: 'queue_empty' };
+        }
+      } else {
+        // P1：hybrid模式 - 优先控制面，回退内置队列（旧行为）
+        console.log('[JobHunter] controller unavailable, fallback to internal queue (hybrid mode)');
+        const nextTask = await this.getNextTask();
+        task = nextTask.task;
+        remaining = nextTask.remaining;
+        fromController = false;
+        console.log('[JobHunter] task source: internal (fallback)');
+        if (!task) {
+          this.isRunning = false;
+          console.log('[JobHunter] No pending tasks, queue empty');
+          return { success: true, total: 0, reason: 'queue_empty' };
+        }
       }
     }
 
@@ -605,6 +923,10 @@ class JobHunterService {
 
     let antiCrawlTriggered = false;
     let lastError = null;  // 跟踪最后发生的错误（P0新增）
+    let keepManualTabOpen = false;
+    const deliveryBatchId = new Date().toISOString().slice(0, 16).replace(/[-T:]/g, '') +
+      '-' + Math.random().toString(36).slice(2, 6);
+    let incrementalInsertedCount = 0;
     const allJobs = [];
     const filteredJobs = [];
     let tab = null;
@@ -613,8 +935,10 @@ class JobHunterService {
       // 3. 创建Boss标签页
       console.log('[JobHunter] Creating tab...');
       tab = await chrome.tabs.create({
-        url: 'https://www.zhipin.com/web/geek/job',
-        active: false
+        url: isManualTask
+          ? this.buildBossSearchUrl(keyword, city.code)
+          : 'https://www.zhipin.com/web/geek/job',
+        active: isManualTask
       });
 
       // 4. 等待页面加载
@@ -632,7 +956,8 @@ class JobHunterService {
         keyword,
         cityCode: city.code,
         pageSize: this.getMaxListPageSize(),
-        experience: this.getExperienceCode()
+        experience: this.getExperienceCode(),
+        maxPagesOverride: isManualTask ? 1 : null
       });
 
       // 反爬检测
@@ -656,6 +981,14 @@ class JobHunterService {
           }
         }
         
+        if (isManualTask) {
+          keepManualTabOpen = true;
+          try {
+            await chrome.tabs.update(tab.id, { active: true });
+          } catch {}
+          console.warn('[JobHunter] Manual task requires in-page intervention, keeping tab open');
+        }
+
         throw new Error(`Search failed: ${searchResult.error}`);
       }
 
@@ -686,6 +1019,9 @@ class JobHunterService {
           errorMessage: null
         });
         await this.reportToController(result);
+        if (fromController && CONFIG.TASK_SOURCE_MODE === 'controller_only') {
+          await this.enterIdlePolling('controller_task_finished');
+        }
         return { success: true, total: 0, reason: 'no_jobs' };
       }
 
@@ -693,7 +1029,9 @@ class JobHunterService {
       console.log(`[JobHunter] Search returned ${searchResult.data.length} jobs:`,
         searchResult.data.map(j => `${j.jobName}[${j.jobExperience || '经验未知'}]`));
       
-      const { kept, filtered, filterReasonStats } = this.filterJobs(searchResult.data);
+      const { kept, filtered, filterReasonStats } = this.filterJobs(searchResult.data, {
+        manualKeyword: isManualTask ? keyword : ''
+      });
       if (filtered.length > 0) {
         console.log(`[JobHunter] Filtered ${filtered.length}/${searchResult.data.length} jobs:`,
           filtered.map(j => `${j.jobName}(${j._filterReason})`));
@@ -725,44 +1063,76 @@ class JobHunterService {
           errorMessage: null
         });
         await this.reportToController(result);
+        if (fromController && CONFIG.TASK_SOURCE_MODE === 'controller_only') {
+          await this.enterIdlePolling('controller_task_finished');
+        }
         return { success: true, total: 0, filtered: filteredJobs.length, reason: 'all_filtered' };
       }
 
       console.log(`[JobHunter] Found ${kept.length} jobs (from ${searchResult.data.length}, filtered ${filtered.length})`);
 
-      const seenJobIds = await this.getSeenJobIdsSet();
+      const seenJobIds = isManualTask ? new Set() : await this.getSeenJobIdsSet();
       const detailCandidates = this.selectDetailCandidates(kept, seenJobIds);
 
       if (detailCandidates.length === 0) {
         console.log(`[JobHunter] No new jobs eligible for detail harvesting (missingEncryptJobId=${this.runStats.missingEncryptJobIdCount}, seenSkipped=${this.runStats.detailSkippedSeenCount})`);
-        this.isRunning = false;
-        await this.saveStats();
-        const result = this.buildTaskResult({
-          city,
-          keyword,
-          taskId,
-          status: 'success',
-          total: 0,
-          pushed: 0,
-          filtered: filteredJobs.length,
-          errorCode: null,
-          errorMessage: null
-        });
-        await this.reportToController(result);
-        return { success: true, total: 0, filtered: filteredJobs.length, reason: 'no_new_jobs' };
+        if (isManualTask && kept.length > 0) {
+          const manualJobs = kept.map((job) => ({
+            ...job,
+            city: city.name,
+            keyword,
+            collectedAt: new Date().toISOString(),
+            description: job.description || ''
+          }));
+          allJobs.push(...manualJobs);
+          this.runStats.totalJobs += manualJobs.length;
+          console.log(`[JobHunter] Manual task fallback: inserting ${manualJobs.length} list jobs without details`);
+        } else {
+          this.isRunning = false;
+          await this.saveStats();
+          const result = this.buildTaskResult({
+            city,
+            keyword,
+            taskId,
+            status: 'success',
+            total: 0,
+            pushed: 0,
+            filtered: filteredJobs.length,
+            errorCode: null,
+            errorMessage: null
+          });
+          await this.reportToController(result);
+          if (fromController && CONFIG.TASK_SOURCE_MODE === 'controller_only') {
+            await this.enterIdlePolling('controller_task_finished');
+          }
+          return { success: true, total: 0, filtered: filteredJobs.length, reason: 'no_new_jobs' };
+        }
       }
 
-      // 搜索后延迟
-      const searchCooldown = this.currentDelay + Math.random() * 2000;
-      console.log(`[JobHunter] ⏱️ Cooling down ${(searchCooldown/1000).toFixed(1)}s after search...`);
-      await this.sleep(searchCooldown);
+      // 搜索后延迟（手动模式：3-5分钟；自动模式：原有策略）
+      if (!this.isRunning) {
+        console.log(`[JobHunter] Stopped by user before search cooldown, saving partial results`);
+      } else {
+        // 手动模式冷却窗口：3-5分钟（收编原有手动绕过冷却逻辑为正式配置）
+        const MANUAL_COOLDOWN_MS = (3 + Math.random() * 2) * 60 * 1000;
+        const searchCooldown = isManualTask ? MANUAL_COOLDOWN_MS : (this.currentDelay + Math.random() * 2000);
+        console.log(`[JobHunter] ⏱️ Cooling down ${(searchCooldown/1000).toFixed(1)}s after search (source: ${this.crawlState.source})...`);
+        await this.sleep(searchCooldown);
+      }
 
       // 7. 获取详情（先去重，再应用预算）
-      const maxDetails = Math.min(detailCandidates.length, this.getMaxDetailRequestsPerRun());
-      console.log(`[JobHunter] Fetching details for ${maxDetails}/${detailCandidates.length} new jobs (MAX_DETAIL_REQUESTS_PER_RUN=${this.getMaxDetailRequestsPerRun()})`);
+      const detailBudget = isManualTask ? 3 : this.getMaxDetailRequestsPerRun();
+      const maxDetails = detailBudget === 0
+        ? detailCandidates.length
+        : Math.min(detailCandidates.length, detailBudget);
+      console.log(`[JobHunter] Fetching details for ${maxDetails}/${detailCandidates.length} new jobs (MAX_DETAIL_REQUESTS_PER_RUN=${detailBudget === 0 ? 'unlimited' : detailBudget})`);
       
       const jobsWithDetails = [];
       for (let i = 0; i < maxDetails; i++) {
+        if (!this.isRunning) {
+          console.log(`[JobHunter] Detail loop stopped by user at [${i}/${maxDetails}]`);
+          break;
+        }
         const job = detailCandidates[i];
         console.log(`[JobHunter] [${i+1}/${maxDetails}] Getting detail: ${job.jobName}`);
         
@@ -781,7 +1151,7 @@ class JobHunterService {
               this.runStats.successWithDesc++;
               this.runStats.detailDescriptionNonEmptyCount++;
             }
-            jobsWithDetails.push({
+            const hydratedJob = {
               ...job,
               description: detailResult.data.description || '',
               hardRequirements: detailResult.data.hardRequirements || '',
@@ -791,9 +1161,24 @@ class JobHunterService {
               bossName: detailResult.data.bossName || job.bossName || '',
               bossTitle: detailResult.data.bossTitle || job.bossTitle || '',
               _source: detailResult.data._source || 'none'
-            });
+            };
+            jobsWithDetails.push(hydratedJob);
             await this.markJobIdSeen(job.encryptJobId, seenJobIds);
             console.log(`[JobHunter]   ✓ Description: ${detailResult.data.description?.length || 0} chars`);
+
+            if (isManualTask) {
+              const jobWithMeta = {
+                ...hydratedJob,
+                city: city.name,
+                keyword,
+                collectedAt: new Date().toISOString()
+              };
+              const insertResult = await this.reportJobsToController(
+                [this.normalizeBossJobForBatchInsert(jobWithMeta, deliveryBatchId)],
+                'boss'
+              );
+              incrementalInsertedCount += (insertResult.inserted || 0) + (insertResult.duplicates || 0);
+            }
           } else {
             this.runStats.failCount++;
             console.log(`[JobHunter]   ✗ Failed: ${detailResult.error || 'Unknown'}`);
@@ -810,6 +1195,10 @@ class JobHunterService {
           }
 
           if (i < maxDetails - 1) {
+            if (!this.isRunning) {
+              console.log(`[JobHunter] Detail loop stopped by user before detail sleep at [${i+1}/${maxDetails}]`);
+              break;
+            }
             const detailDelay = this.currentDelay + Math.random() * 3000;
             console.log(`[JobHunter]   ⏱️ Waiting ${(detailDelay/1000).toFixed(1)}s...`);
             await this.sleep(detailDelay);
@@ -842,18 +1231,22 @@ class JobHunterService {
         console.log(`[JobHunter] Task put back due to anti-crawl`);
       }
     } finally {
-      await this.closeTabIfNeeded(tab?.id);
+      if (keepManualTabOpen) {
+        console.log(`[JobHunter] Keeping manual task tab open: ${tab?.id}`);
+      } else {
+        await this.closeTabIfNeeded(tab?.id);
+      }
     }
 
     // 9. 推送到飞书
-    const deliveryBatchId = allJobs.length > 0
-      ? new Date().toISOString().slice(0, 16).replace(/[-T:]/g, '') +
-        '-' + Math.random().toString(36).slice(2, 6)
-      : null;
-
     let pushedCount = 0;
     if (allJobs.length > 0) {
-      if (this.isControllerDeliveryEnabled()) {
+      if (isManualTask) {
+        pushedCount = incrementalInsertedCount;
+        if (!this.isControllerDeliveryEnabled()) {
+          await this.pushToFeishu(allJobs, deliveryBatchId);
+        }
+      } else if (this.isControllerDeliveryEnabled()) {
         const detailReport = await this.reportDetailsToController(allJobs, taskId, deliveryBatchId);
         pushedCount = (detailReport.inserted || 0) + (detailReport.duplicates || 0);
       } else {
@@ -887,6 +1280,7 @@ class JobHunterService {
       status = 'success';
     }
     
+    const actualWithDesc = allJobs.filter(j => j.description?.length > 0).length;
     const result = this.buildTaskResult({
       city,
       keyword,
@@ -895,10 +1289,24 @@ class JobHunterService {
       total: allJobs.length,
       pushed: pushedCount,
       filtered: filteredJobs.length,
+      withDescription: actualWithDesc,
       errorCode: antiCrawlTriggered ? this.crawlState.status : null,
       errorMessage: lastError ? lastError.message : null
     });
+    console.log('[JobHunter] Result parity check:', {
+      actualWithDescription: actualWithDesc,
+      runStatsWithDescription: this.runStats.detailDescriptionNonEmptyCount,
+      parity: actualWithDesc === this.runStats.detailDescriptionNonEmptyCount ? 'MATCH' : 'MISMATCH',
+      successWithDesc: this.runStats.successWithDesc,
+      totalJobs: allJobs.length,
+      jobsWithUrl: allJobs.filter(j => Boolean(j.url)).length,
+      sampleUrls: allJobs.slice(0, 3).map(j => j.url || null),
+      sampleDescLengths: allJobs.slice(0, 3).map(j => (j.description || '').length)
+    });
     await this.reportToController(result);
+    if (fromController && CONFIG.TASK_SOURCE_MODE === 'controller_only') {
+      await this.enterIdlePolling('controller_task_finished');
+    }
 
     // 13. 返回结果
     if (antiCrawlTriggered) {
@@ -909,7 +1317,8 @@ class JobHunterService {
         filtered: filteredJobs.length,
         antiCrawl: true,
         status: this.crawlState.status,
-        blockedUntil: this.crawlState.blockedUntil
+        blockedUntil: this.crawlState.blockedUntil,
+        crawlBatchId: deliveryBatchId
       };
     }
 
@@ -919,7 +1328,8 @@ class JobHunterService {
       withDescription: allJobs.filter(j => j.description?.length > 0).length,
       pushed: pushedCount,
       filtered: filteredJobs.length,
-      queueRemaining: remaining
+      queueRemaining: remaining,
+      crawlBatchId: deliveryBatchId
     };
   }
 
@@ -1019,9 +1429,16 @@ class JobHunterService {
       }
     }
 
-    // 从飞书API拉取
-    console.log('[JobHunter] Fetching option dict from Feishu API...');
-    const dict = await this.fetchOptionDictFromAPI();
+    let dict = {};
+    if (this.isControllerDeliveryEnabled()) {
+      console.log('[JobHunter] Fetching option dict from controller...');
+      dict = await this.fetchOptionDictFromController();
+    }
+
+    if (!dict || Object.keys(dict).length === 0) {
+      console.log('[JobHunter] Fetching option dict from Feishu API...');
+      dict = await this.fetchOptionDictFromAPI();
+    }
 
     // 缓存
     await chrome.storage.local.set({
@@ -1029,6 +1446,22 @@ class JobHunterService {
     });
 
     return dict;
+  }
+
+  async fetchOptionDictFromController() {
+    try {
+      const res = await fetch(`${CONFIG.CONTROLLER_BASE_URL}/feishu/option-dict`);
+      const data = await res.json();
+      if (!res.ok || !data.success || !data.optionDict) {
+        console.warn('[JobHunter] Controller option dict unavailable');
+        return {};
+      }
+      console.log('[JobHunter] Option dict loaded from controller:', Object.keys(data.optionDict));
+      return data.optionDict;
+    } catch (error) {
+      console.warn('[JobHunter] Error fetching option dict from controller:', error.message);
+      return {};
+    }
   }
 
   async fetchOptionDictFromAPI() {
@@ -1157,6 +1590,7 @@ class JobHunterService {
     const crawlTime = Date.now();
 
     return {
+      "encryptBrandId": job.encryptBrandId || null,
       "文本": `JOB-${job.encryptJobId?.slice(-8)}`,
       "职位名称": this.truncate(job.jobName, 100),
       "公司名称": this.truncate(job.brandName, 100),
@@ -1608,16 +2042,26 @@ class JobHunterService {
     return candidates;
   }
 
-  async scrapeJobListPages(tabId, { keyword, cityCode, pageSize, experience }) {
+  async scrapeJobListPages(tabId, { keyword, cityCode, pageSize, experience, maxPagesOverride = null }) {
     const mergedJobs = [];
     const seenListJobKeys = new Set();
     let lastError = null;
     let pagesFetched = 0;
 
-    const maxPagesPerRun = this.getMaxListPagesPerRun();
+    const maxPagesPerRun = Number.isInteger(maxPagesOverride)
+      ? maxPagesOverride
+      : this.getMaxListPagesPerRun();
 
-    for (let page = 1; page <= maxPagesPerRun; page++) {
-      console.log(`[JobHunter] Fetching list page ${page}/${maxPagesPerRun} for ${keyword}`);
+    for (let page = 1; ; page += 1) {
+      if (!this.isRunning) {
+        console.log(`[JobHunter] List pagination stopped by user at page ${page}`);
+        break;
+      }
+      if (maxPagesPerRun !== 0 && page > maxPagesPerRun) {
+        break;
+      }
+
+      console.log(`[JobHunter] Fetching list page ${page}/${maxPagesPerRun === 0 ? 'unlimited' : maxPagesPerRun} for ${keyword}`);
 
       const pageResult = await this.sendMessageToTab(tabId, {
         type: 'SCRAPE_JOBS',
@@ -1630,6 +2074,14 @@ class JobHunterService {
 
       if (!pageResult.success) {
         lastError = pageResult.error;
+        if (typeof pageResult.error === 'string' && pageResult.error.includes('Security check required')) {
+          return {
+            success: false,
+            error: pageResult.error,
+            code: pageResult.code,
+            pagesFetched
+          };
+        }
         if (this.isAntiCrawlError(pageResult.error)) {
           console.warn(`[JobHunter] List page ${page} hit anti-crawl, stop pagination`);
         } else {
@@ -1666,7 +2118,11 @@ class JobHunterService {
         break;
       }
 
-      if (page < maxPagesPerRun) {
+      if (maxPagesPerRun === 0 || page < maxPagesPerRun) {
+        if (!this.isRunning) {
+          console.log(`[JobHunter] List pagination stopped by user before sleep`);
+          break;
+        }
         const pageDelay = this.currentDelay + Math.random() * 2000;
         console.log(`[JobHunter]   ⏱️ Waiting ${(pageDelay / 1000).toFixed(1)}s before next list page...`);
         await this.sleep(pageDelay);
@@ -1687,7 +2143,7 @@ class JobHunterService {
     };
   }
 
-  buildTaskResult({ city, keyword, taskId, status, total, pushed, filtered, errorCode, errorMessage }) {
+  buildTaskResult({ city, keyword, taskId, status, total, pushed, filtered, errorCode, errorMessage, withDescription }) {
     return {
       task: {
         city: city.name || city,
@@ -1697,7 +2153,7 @@ class JobHunterService {
       ...this.getVersionInfo(),
       status,
       total,
-      withDescription: this.runStats.detailDescriptionNonEmptyCount,
+      withDescription: withDescription ?? this.runStats.detailDescriptionNonEmptyCount,
       pushed,
       filtered,
       errorCode,
@@ -1713,6 +2169,14 @@ class JobHunterService {
       filterReasonStats: this.runStats.filterReasonStats || null,
       timestamp: Date.now()
     };
+  }
+
+  buildBossSearchUrl(keyword, cityCode) {
+    const params = new URLSearchParams({
+      query: keyword,
+      city: cityCode
+    });
+    return `https://www.zhipin.com/web/geek/jobs?${params.toString()}`;
   }
 
   // 带重试机制的详情获取
@@ -1755,13 +2219,14 @@ class JobHunterService {
    * 轻量规则评分：对岗位打分，低于阈值则过滤
    * 返回 { score, reason }，reason为空表示通过
    */
-  scoreJob(job) {
+  scoreJob(job, options = {}) {
     let score = 0;
     const title = job.jobName || '';
     const exp = job.jobExperience || '';
     const titleLower = title.toLowerCase();
     const filterMode = this.getJobFilterMode();
     const expHardExclude = this.getExpHardExcludeRegex();
+    const manualKeyword = (options.manualKeyword || '').trim();
 
     // 硬排除：标题命中明确的校招性质词
     if (CONFIG.FILTER.TITLE_HARD_EXCLUDE.test(title)) {
@@ -1778,7 +2243,7 @@ class JobHunterService {
     }
 
     // 硬排除：经验年限过长
-    if (expHardExclude.test(exp)) {
+    if (expHardExclude && expHardExclude.test(exp)) {
       const match = exp.match(expHardExclude);
       return { score: -10, reason: `经验"${match[0]}"` };
     }
@@ -1788,7 +2253,11 @@ class JobHunterService {
       score -= 5;
     }
 
-    if (filterMode === 'general_pm' && !CONFIG.FILTER.GENERAL_PM_INCLUDE.test(title)) {
+    if (manualKeyword) {
+      if (!this.matchesManualKeyword(title, manualKeyword)) {
+        return { score: -10, reason: `标题不匹配关键词"${manualKeyword}"` };
+      }
+    } else if (filterMode === 'general_pm' && !CONFIG.FILTER.GENERAL_PM_INCLUDE.test(title)) {
       return { score: -10, reason: '标题不属于产品经理岗位' };
     }
 
@@ -1827,13 +2296,13 @@ class JobHunterService {
    * 返回 { kept, filtered, filterReasonStats }
    *   filterReasonStats: { "原因摘要": [count, "岗位列表"] }
    */
-  filterJobs(jobs) {
+  filterJobs(jobs, options = {}) {
     const kept = [];
     const filtered = [];
     const filterReasonStats = {};
 
     for (const job of jobs) {
-      const { score, reason } = this.scoreJob(job);
+      const { score, reason } = this.scoreJob(job, options);
       if (reason) {
         filtered.push({ ...job, _filtered: true, _filterReason: reason, _score: score });
         if (!filterReasonStats[reason]) filterReasonStats[reason] = [];
@@ -1844,6 +2313,23 @@ class JobHunterService {
     }
 
     return { kept, filtered, filterReasonStats };
+  }
+
+  matchesManualKeyword(title, keyword) {
+    const normalizedTitle = String(title || '').toLowerCase().replace(/\s+/g, '');
+    const normalizedKeyword = String(keyword || '').toLowerCase().replace(/\s+/g, '');
+    if (!normalizedKeyword) return true;
+
+    const tokens = normalizedKeyword
+      .split(/[+/,&|，、\s]+/)
+      .map(token => token.trim())
+      .filter(Boolean);
+
+    if (tokens.length > 0) {
+      return tokens.every(token => normalizedTitle.includes(token));
+    }
+
+    return normalizedTitle.includes(normalizedKeyword);
   }
 
   // ============ 采集统计 ============
@@ -2159,8 +2645,1614 @@ class JobHunterService {
     }
   }
 
+  /**
+   * 将采集数据批量写入控制面 scraped_jobs 表
+   * 适用于 51job 等非 Boss 平台的数据入库
+   *
+   * @param {Array<Object>} jobs - 归一化后的职位数据数组
+   * @param {string} platform - 平台标识（如 '51job'）
+   * @returns {Object} { inserted, duplicates, errors }
+   */
+  async reportJobsToController(jobs, platform, options = {}) {
+    if (!jobs || jobs.length === 0) {
+      return { inserted: 0, duplicates: 0, errors: [] };
+    }
+
+    try {
+      const crawlBatchId = options.crawlBatchId || null;
+      const normalizedJobs = crawlBatchId
+        ? jobs.map((job) => (
+          job && !job.crawlBatchId
+            ? { ...job, crawlBatchId }
+            : job
+        ))
+        : jobs;
+      const response = await fetch(`${CONFIG.CONTROLLER_BASE_URL}/api/jobs/batch-insert`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          platform,
+          crawlBatchId,
+          jobs: normalizedJobs
+        })
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`[JobHunter] batch-insert rejected: ${response.status} ${errorText}`);
+        return { inserted: 0, duplicates: 0, errors: [{ error: `HTTP_${response.status}` }] };
+      }
+
+      const result = await response.json();
+      console.log(
+        `[JobHunter] batch-insert: platform=${platform}, ` +
+        `inserted=${result.inserted || 0}, duplicates=${result.duplicates || 0}`
+      );
+      return {
+        inserted: result.inserted || 0,
+        duplicates: result.duplicates || 0,
+        errors: Array.isArray(result.errors) ? result.errors : []
+      };
+    } catch (error) {
+      console.warn(`[JobHunter] batch-insert error: ${error.message}`);
+      return { inserted: 0, duplicates: 0, errors: [{ error: error.message }] };
+    }
+  }
+
+  async syncJobDetailStatusToController(job, platform) {
+    if (!job || !platform || !job.platformJobId || !job.detailStatus || job.detailStatus === 'pending') {
+      return false;
+    }
+
+    try {
+      const response = await fetch(`${CONFIG.CONTROLLER_BASE_URL}/api/jobs/detail-status-update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          platform,
+          platformJobId: job.platformJobId,
+          detailStatus: job.detailStatus,
+          description: job.description || '',
+          errorCode: job.detailErrorCode || ''
+        })
+      });
+
+      if (!response.ok) {
+        return false;
+      }
+      return true;
+    } catch (error) {
+      console.warn(`[JobHunter] Failed to sync detail status for ${platform}/${job.platformJobId}: ${error.message}`);
+      return false;
+    }
+  }
+
+  normalizeBossJobForBatchInsert(job, batchId = null) {
+    const location = [job.locationName, job.areaDistrict].filter(Boolean).join(' ');
+    const keywords = Array.isArray(job.skills) ? job.skills.join(', ') : (job.skills || '');
+    const experience = job.experience || job.jobExperience || '';
+    const education = job.education || job.jobDegree || '';
+    const resolvedUrl = job.url || null;
+    return {
+      platform: 'boss',
+      platformJobId: job.encryptJobId || '',
+      title: job.jobName || '',
+      company: job.brandName || '',
+      location: location || job.city || null,
+      url: resolvedUrl,
+      keywords,
+      salary: job.salaryDesc || null,
+      experience: experience || null,
+      education: education || null,
+      crawlBatchId: batchId || null,
+      crawlMode: 'dashboard_manual',
+      rawPayload: job
+    };
+  }
+
+  // ============ 51job 采集调度（DOM解析模式） ============
+
+  async get51JobAreaCatalog() {
+    if (this._51jobAreaCatalogPromise) {
+      return this._51jobAreaCatalogPromise;
+    }
+
+    this._51jobAreaCatalogPromise = (async () => {
+      const response = await fetch('https://js.51jobcdn.com/in/js/2023/dd/dd_area_translation.json');
+      if (!response.ok) {
+        throw new Error(`51job area dictionary request failed: HTTP ${response.status}`);
+      }
+
+      const rows = await response.json();
+      if (!Array.isArray(rows)) {
+        throw new Error('51job area dictionary format invalid');
+      }
+
+      return rows
+        .filter((item) => item && item.code && item.value && (item.codeType === '1' || item.codeType === '2'))
+        .map((item) => ({
+          code: String(item.code),
+          name: String(item.value).trim(),
+          type: item.codeType === '1' ? 'province' : 'city',
+          parentProvinceCode: item.parentProvinceCode || '',
+          childCityCodeList: Array.isArray(item.childCityCodeList) ? item.childCityCodeList : []
+        }));
+    })();
+
+    try {
+      return await this._51jobAreaCatalogPromise;
+    } catch (error) {
+      this._51jobAreaCatalogPromise = null;
+      throw error;
+    }
+  }
+
+  /**
+   * 51job 专用采集流程
+   * 通过 chrome.tabs 打开搜索页 → 向 content-51job.js 发送 SCRAPE_JOBS → 收集返回数据
+   * 与 Boss 的 executeCrawlTask() 完全独立，互不干扰
+   *
+   * @returns {Object} { success, totalJobs, cityDetails }
+   */
+  async execute51JobCrawl(options = {}) {
+    const areaCatalog = await this.get51JobAreaCatalog();
+    const requestedCity = typeof options.city === 'string' ? options.city.trim() : '';
+    const requestedKeyword = typeof options.keyword === 'string' ? options.keyword.trim() : '';
+    const normalizeRequestedCity = (value) => String(value || '')
+      .trim()
+      .replace(/\s+/g, '')
+      .replace(/市$/u, '')
+      .replace(/省$/u, '')
+      .toLowerCase();
+    const normalizedRequestedCity = normalizeRequestedCity(requestedCity);
+    const cities = requestedCity
+      ? areaCatalog.filter((item) => {
+        const normalizedName = normalizeRequestedCity(item.name);
+        return normalizedName === normalizedRequestedCity ||
+          normalizedName.includes(normalizedRequestedCity) ||
+          normalizedRequestedCity.includes(normalizedName);
+      })
+      : areaCatalog.filter((item) => ['北京', '上海', '深圳', '杭州'].includes(item.name));
+    const keywords = requestedKeyword ? [requestedKeyword] : (CONFIG.KEYWORDS || ['AI产品经理']);
+    const allJobs = [];
+    const cityDetails = [];
+    const crawlBatchId = new Date().toISOString().slice(0, 16).replace(/[-T:]/g, '') +
+      '-' + Math.random().toString(36).slice(2, 6);
+    this.setActiveCrawlSession({
+      isActive: true,
+      platform: '51job',
+      crawlBatchId,
+      keyword: requestedKeyword || '',
+      city: requestedCity || '',
+      groupSize: 20,
+      startedAt: Date.now(),
+      endedAt: null
+    });
+
+    // 分页配置（复用智联的 MAX_LIST_PAGES 配置）
+    const maxPages = this.getMaxListPages();
+    const detailBudget = this.getDetailBudgetPerRun();
+    const detailInterval = this.getDetailRequestIntervalMs();
+
+    console.log(
+      `[51job] 开始采集: ${cities.length} 城市 x ${keywords.length} 关键词, ` +
+      `maxPages=${maxPages}, detailBudget=${detailBudget}, detailInterval=${detailInterval}ms`
+    );
+
+    try {
+      if (cities.length === 0) {
+        return {
+          success: false,
+          totalJobs: 0,
+          cityDetails: [],
+          jobs: [],
+          error: `不支持的前程无忧城市: ${requestedCity}`
+        };
+      }
+
+      let totalInserted = 0;
+
+      for (const city of cities) {
+        for (const keyword of keywords) {
+          // 检查是否被用户停止
+          if (!this.isRunning) {
+            console.log('[51job] 采集被用户中断');
+            break;
+          }
+
+          const crawlResult = await this._51jobCrawlCityKeyword(city, keyword, {
+            maxPages,
+            detailBudget,
+            detailInterval,
+            crawlBatchId
+          });
+
+          if (crawlResult.jobs.length > 0) {
+            allJobs.push(...crawlResult.jobs);
+          }
+          cityDetails.push(crawlResult.detail);
+          totalInserted += crawlResult.detail?.totalNew || 0;
+        }
+
+        // 外层中断检查
+        if (!this.isRunning) break;
+      }
+
+      console.log(`[51job] 采集完成: 共 ${allJobs.length} 条职位`);
+
+      return {
+        success: true,
+        totalJobs: allJobs.length,
+        inserted: totalInserted,
+        withDescription: allJobs.filter(job => Boolean(job.description && job.description.trim())).length,
+        crawlBatchId,
+        cityDetails,
+        jobs: allJobs
+      };
+    } finally {
+      this.setActiveCrawlSession({
+        isActive: false,
+        crawlBatchId,
+        platform: '51job',
+        endedAt: Date.now()
+      });
+    }
+  }
+
+  /**
+   * 执行单个 city + keyword 的 51job 分页采集
+   *
+   * 调度流程（与智联 _zhaopinCrawlCityKeyword 同构）：
+   * 1. 通过控制面 API 创建 p1 ~ pN 页码任务（platform='51job'）
+   * 2. 逐页查询 pending 任务 → 标记 running → 采集 → 入库去重 → 标记 done
+   * 3. 每页采集后检查终止条件
+   * 4. 翻页 URL: https://we.51job.com/pc/search?jobArea={code}&keyword={kw}&curr={pageNum}
+   *
+   * @param {Object} city - { code, name }
+   * @param {string} keyword - 搜索关键词
+   * @param {Object} config - { maxPages, detailBudget, detailInterval }
+   * @returns {Object} { jobs: Array, detail: Object }
+   */
+  async _51jobCrawlCityKeyword(city, keyword, config) {
+    const { maxPages, detailBudget = 0, detailInterval = 3000, crawlBatchId = null } = config;
+    const jobs = [];
+    let consecutiveNoNewPages = 0;
+    let totalFound = 0;
+    let totalNew = 0;
+    let effectiveMaxPages = maxPages;
+    let remainingDetailBudget = detailBudget;
+
+    const pageTaskResolution = await this._resolve51jobPageTasks(city, keyword, maxPages);
+    let pendingTasks = pageTaskResolution.tasks;
+    const usingControllerPageTasks = pageTaskResolution.usingController;
+
+    // 按 page_number 排序
+    pendingTasks.sort((a, b) => a.page_number - b.page_number);
+
+    // SPA 模式：复用同一个 tab，p1 打开搜索页，p2+ 通过点击翻页
+    let sharedTabId = null;
+    const baseUrl =
+      `https://we.51job.com/pc/search?jobArea=${city.code}` +
+      `&keyword=${encodeURIComponent(keyword)}&searchType=2&keywordType=`;
+
+    try {
+      for (let taskIndex = 0; taskIndex < pendingTasks.length; taskIndex++) {
+        // 检查是否被用户停止
+        if (!this.isRunning) {
+          console.log('[51job] 分页采集中断');
+          break;
+        }
+
+        const task = pendingTasks[taskIndex];
+        const pageNum = task.page_number;
+
+        // 2a. 标记为 running
+        if (usingControllerPageTasks && task.id) {
+          try {
+            await fetch(`${CONFIG.CONTROLLER_BASE_URL}/api/page-tasks/update`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id: task.id, status: 'running' })
+            });
+          } catch (err) {
+            console.warn(`[51job] 更新任务状态失败 (task#${task.id}): ${err.message}`);
+          }
+        }
+
+        let pageJobs = [];
+        let pageError = null;
+        let pageMeta = null;
+
+        try {
+          if (pageNum === 1) {
+            // p1: 打开搜索页（不带 curr 参数，避免 SPA 仍显示 p1 的问题）
+            const tab = await this.createTabWithRetry({ url: baseUrl, active: false });
+            sharedTabId = tab.id;
+            console.log(`[51job] 打开标签页 ${sharedTabId}: ${city.name} - ${keyword} - p1`);
+            await this.sleep(5000);
+          } else {
+            // p2+: 在同一个 tab 内通过 content script 点击翻页
+            console.log(`[51job] 页内翻页: ${city.name} - ${keyword} - p${pageNum}`);
+            const navResponse = await this.sendTabMessageWithRetry(
+              sharedTabId,
+              { type: 'NAVIGATE_TO_PAGE', page: pageNum }
+            );
+            if (!navResponse || !navResponse.success) {
+              const navError = navResponse ? (navResponse.error || '翻页超时') : '无响应';
+              console.warn(`[51job] 页内翻页失败 p${pageNum}: ${navError}`);
+              pageError = navError;
+              // 翻页失败视为空页，触发终止条件
+            } else {
+              // 翻页成功后短暂等待 DOM 渲染
+              await this.sleep(3000);
+            }
+          }
+
+          // 如果翻页没有失败，发送 SCRAPE_JOBS 采集当前页数据
+          if (!pageError) {
+            const response = await this.sendTabMessageWithRetry(sharedTabId, { type: 'SCRAPE_JOBS' });
+
+            if (response && response.success && response.data && response.data.length > 0) {
+              pageJobs = response.data;
+              pageMeta = response.pagination || null;
+              console.log(`[51job] ${city.name} ${keyword} p${pageNum}: 采集 ${pageJobs.length} 条`);
+            } else {
+              pageError = response ? (response.error || '无数据') : '无响应';
+              pageMeta = response && response.pagination ? response.pagination : null;
+              console.warn(`[51job] ${city.name} ${keyword} p${pageNum}: ${pageError}`);
+            }
+          }
+
+          // 更新运行时统计
+          this.runStats.pagesFetched++;
+        } catch (err) {
+          pageError = err.message;
+          console.warn(`[51job] ${city.name} ${keyword} p${pageNum} 采集失败: ${err.message}`);
+        }
+
+        if (pageJobs.length > 0 && remainingDetailBudget > 0) {
+          const detailResult = await this.enrich51JobDetails(pageJobs, {
+            budget: remainingDetailBudget,
+            interval: detailInterval,
+            searchTabId: sharedTabId
+          });
+          remainingDetailBudget -= detailResult.consumed;
+        }
+
+        if (pageJobs.length > 0 && crawlBatchId) {
+          for (const job of pageJobs) {
+            if (job && !job.crawlBatchId) {
+              job.crawlBatchId = crawlBatchId;
+            }
+          }
+        }
+
+        // 2c. 入库并统计新/重（复用 platform + platformJobId 唯一约束去重）
+        let inserted = 0;
+        let duplicated = 0;
+        if (pageJobs.length > 0) {
+          try {
+            const insertResult = await this.reportJobsToController(pageJobs, '51job', { crawlBatchId });
+            inserted = insertResult.inserted || 0;
+            duplicated = insertResult.duplicates || 0;
+            for (const job of pageJobs) {
+              if (job?.detailStatus && job.detailStatus !== 'pending') {
+                await this.syncJobDetailStatusToController(job, '51job');
+              }
+            }
+          } catch (err) {
+            console.warn(`[51job] 入库失败: ${err.message}`);
+          }
+          jobs.push(...pageJobs);
+        }
+
+        totalFound += pageJobs.length;
+        totalNew += inserted;
+
+        if (pageMeta && Number.isInteger(pageMeta.totalPages) && pageMeta.totalPages > effectiveMaxPages) {
+          const previousMaxPages = effectiveMaxPages;
+          effectiveMaxPages = pageMeta.totalPages;
+          const existingPages = new Set(pendingTasks.map((item) => item.page_number));
+          for (let nextPage = previousMaxPages + 1; nextPage <= effectiveMaxPages; nextPage++) {
+            if (existingPages.has(nextPage)) continue;
+            pendingTasks.push({
+              id: null,
+              page_number: nextPage,
+              source: 'auto-pagination'
+            });
+          }
+          pendingTasks.sort((a, b) => a.page_number - b.page_number);
+          console.log(
+            `[51job] 检测到真实分页 ${pageMeta.totalPages} 页，已从 ${previousMaxPages} 页扩展到 ${effectiveMaxPages} 页`
+          );
+        }
+
+        // 2d. 更新任务状态为 done
+        if (usingControllerPageTasks && task.id) {
+          try {
+            await fetch(`${CONFIG.CONTROLLER_BASE_URL}/api/page-tasks/update`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                id: task.id,
+                status: pageJobs.length === 0 && pageError ? 'failed' : 'done',
+                jobsFound: pageJobs.length,
+                jobsNew: inserted,
+                error: pageError || undefined
+              })
+            });
+          } catch (err) {
+            console.warn(`[51job] 更新任务完成状态失败 (task#${task.id}): ${err.message}`);
+          }
+        }
+
+        // 2e. 检查页终止条件（复用智联的终止逻辑）
+        const stopReason = this._checkPageStopCondition(pageJobs, inserted, consecutiveNoNewPages, pageNum, effectiveMaxPages);
+        if (stopReason) {
+          console.log(`[51job] 页终止条件触发: ${stopReason} (p${pageNum})`);
+          break;
+        }
+
+        // 更新连续无新计数
+        if (inserted === 0) {
+          consecutiveNoNewPages++;
+        } else {
+          consecutiveNoNewPages = 0;
+        }
+
+        // 防反爬间隔（3-8秒随机延迟）
+        const delay = 3000 + Math.random() * 5000;
+        await this.sleep(delay);
+      }
+    } finally {
+      // 所有页完成后关闭 tab（无论成功或异常）
+      if (sharedTabId) {
+        try { await chrome.tabs.remove(sharedTabId); } catch (e) { /* 忽略 */ }
+        console.log(`[51job] 已关闭标签页 ${sharedTabId}`);
+      }
+    }
+
+    return {
+      jobs,
+      detail: {
+        city: city.name,
+        keyword,
+        count: jobs.length,
+        totalFound,
+        totalNew,
+        withDescription: jobs.filter(job => Boolean(job.description && job.description.trim())).length
+      }
+    };
+  }
+
+  async createTabWithRetry(createProperties, maxAttempts = 3) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await chrome.tabs.create(createProperties);
+      } catch (error) {
+        lastError = error;
+        const message = error && error.message ? error.message : String(error);
+        const isTransient = /Tabs cannot be edited right now|dragging a tab/i.test(message);
+        if (!isTransient || attempt === maxAttempts) {
+          throw error;
+        }
+        console.warn(`[JobHunter] createTab transient failure (${attempt}/${maxAttempts}): ${message}`);
+        await this.sleep(1200 * attempt);
+      }
+    }
+    throw lastError || new Error('Failed to create tab');
+  }
+
+  async sendTabMessageWithRetry(tabId, message, maxAttempts = 3) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await chrome.tabs.sendMessage(tabId, message);
+      } catch (error) {
+        lastError = error;
+        const text = error && error.message ? error.message : String(error);
+        const isTransient = /Receiving end does not exist|message port closed|No tab with id/i.test(text);
+        if (!isTransient || attempt === maxAttempts) {
+          throw error;
+        }
+        console.warn(`[JobHunter] sendMessage transient failure (${attempt}/${maxAttempts}): ${text}`);
+        await this.sleep(1000 * attempt);
+      }
+    }
+    throw lastError || new Error('Failed to send tab message');
+  }
+
+  getPlatformLabel(platform) {
+    const labels = {
+      boss: 'Boss直聘',
+      '51job': '前程无忧',
+      liepin: '猎聘',
+      zhaopin: '智联招聘'
+    };
+    return labels[platform] || platform || '目标平台';
+  }
+
+  getManualVerificationState() {
+    return {
+      required: Boolean(this.manualVerification.required),
+      platform: this.manualVerification.platform || null,
+      platformLabel: this.manualVerification.platformLabel || '',
+      message: this.manualVerification.message || '',
+      validationTabId: this.manualVerification.validationTabId || null,
+      requestedAt: this.manualVerification.requestedAt || null
+    };
+  }
+
+  setManualVerificationState(nextState = {}) {
+    this.manualVerification = {
+      ...this.manualVerification,
+      ...nextState
+    };
+  }
+
+  async focusManualVerificationTab() {
+    const tabId = this.manualVerification.validationTabId;
+    if (!tabId) return false;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      await chrome.tabs.update(tab.id, { active: true });
+      if (typeof tab.windowId === 'number') {
+        await chrome.windows.update(tab.windowId, { focused: true });
+      }
+      return true;
+    } catch (error) {
+      console.warn(`[JobHunter] Failed to focus verification tab ${tabId}: ${error.message}`);
+      return false;
+    }
+  }
+
+  async prepareManualVerificationTab({ platform, sourceTabId, currentUrl, duplicateFromSource = false }) {
+    const label = this.getPlatformLabel(platform);
+    let validationTabId = null;
+
+    if (duplicateFromSource || !sourceTabId) {
+      const tab = await this.createTabWithRetry({
+        url: currentUrl,
+        active: true
+      });
+      validationTabId = tab.id;
+    } else {
+      validationTabId = sourceTabId;
+      await chrome.tabs.update(validationTabId, { active: true });
+      try {
+        const existingTab = await chrome.tabs.get(validationTabId);
+        if (typeof existingTab.windowId === 'number') {
+          await chrome.windows.update(existingTab.windowId, { focused: true });
+        }
+      } catch (error) {
+        console.warn(`[JobHunter] Failed to focus ${label} verification window: ${error.message}`);
+      }
+    }
+
+    this.setManualVerificationState({
+      required: true,
+      platform,
+      platformLabel: label,
+      message: `请在新打开的 ${label} 标签页中完成滑块验证，然后回到采集页点击“已验证”继续。`,
+      validationTabId,
+      requestedAt: Date.now()
+    });
+
+    return validationTabId;
+  }
+
+  async waitForManualVerification({ platform, sourceTabId, currentUrl, duplicateFromSource = false }) {
+    if (this.manualVerification.required && this.manualVerification.platform === platform && this.manualVerificationResolver) {
+      await this.focusManualVerificationTab();
+      return new Promise((resolve) => {
+        const previousResolver = this.manualVerificationResolver;
+        this.manualVerificationResolver = (verified) => {
+          previousResolver(verified);
+          resolve(verified);
+        };
+      });
+    }
+
+    const validationTabId = await this.prepareManualVerificationTab({
+      platform,
+      sourceTabId,
+      currentUrl,
+      duplicateFromSource
+    });
+
+    return new Promise((resolve) => {
+      this.manualVerificationResolver = (verified) => {
+        this.manualVerificationResolver = null;
+        this.setManualVerificationState({
+          required: false,
+          platform: null,
+          platformLabel: '',
+          message: '',
+          validationTabId: null,
+          requestedAt: null
+        });
+        resolve({ verified, validationTabId });
+      };
+    });
+  }
+
+  resolveManualVerification(verified) {
+    if (!this.manualVerificationResolver) {
+      this.setManualVerificationState({
+        required: false,
+        platform: null,
+        platformLabel: '',
+        message: '',
+        validationTabId: null,
+        requestedAt: null
+      });
+      return;
+    }
+    const resolver = this.manualVerificationResolver;
+    this.manualVerificationResolver = null;
+    this.setManualVerificationState({
+      required: false,
+      platform: null,
+      platformLabel: '',
+      message: '',
+      validationTabId: null,
+      requestedAt: null
+    });
+    resolver(Boolean(verified));
+  }
+
+  async waitForTabComplete(tabId, timeoutMs = 15000) {
+    try {
+      const currentTab = await chrome.tabs.get(tabId);
+      if (currentTab && currentTab.status === 'complete') {
+        return currentTab;
+      }
+    } catch (error) {
+      throw new Error(`Tab ${tabId} not available: ${error.message}`);
+    }
+
+    return new Promise((resolve, reject) => {
+      let timeoutId = null;
+
+      const cleanup = () => {
+        if (timeoutId) clearTimeout(timeoutId);
+        chrome.tabs.onUpdated.removeListener(listener);
+      };
+
+      const listener = (updatedTabId, info, tab) => {
+        if (updatedTabId !== tabId) return;
+        if (info.status === 'complete') {
+          cleanup();
+          resolve(tab);
+        }
+      };
+
+      timeoutId = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Timed out waiting for tab ${tabId} to complete`));
+      }, timeoutMs);
+
+      chrome.tabs.onUpdated.addListener(listener);
+    });
+  }
+
+  isMatching51JobDetailUrl(url, { expectedUrl = '', platformJobId = '' } = {}) {
+    const candidate = String(url || '').trim();
+    if (!candidate) return false;
+
+    let parsed = null;
+    try {
+      parsed = new URL(candidate);
+    } catch (error) {
+      return false;
+    }
+
+    if (!/^jobs\.51job\.com$/i.test(parsed.hostname)) {
+      return false;
+    }
+
+    if (platformJobId) {
+      const escapedJobId = String(platformJobId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (new RegExp(`/${escapedJobId}\\.html(?:$|[?#])`, 'i').test(parsed.pathname + parsed.search + parsed.hash)) {
+        return true;
+      }
+    }
+
+    if (!expectedUrl) return true;
+
+    try {
+      const expected = new URL(expectedUrl);
+      return parsed.origin === expected.origin && parsed.pathname === expected.pathname;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  waitFor51JobDetailTab(searchTabId, {
+    expectedUrl = '',
+    platformJobId = '',
+    knownTabIds = [],
+    timeoutMs = 30000
+  } = {}) {
+    let cleanupRef = null;
+    const promise = new Promise((resolve, reject) => {
+      let timeoutId = null;
+      let intervalId = null;
+      let settled = false;
+      const knownIds = new Set(Array.isArray(knownTabIds) ? knownTabIds.filter(Number.isFinite) : []);
+
+      const cleanup = () => {
+        if (timeoutId) clearTimeout(timeoutId);
+        if (intervalId) clearInterval(intervalId);
+        chrome.tabs.onCreated.removeListener(handleCreated);
+        chrome.tabs.onUpdated.removeListener(handleUpdated);
+      };
+      cleanupRef = cleanup;
+
+      const maybeResolve = async (tabId, url, reusedSearchTab = false) => {
+        if (settled) return;
+        const candidateUrl = String(url || '').trim();
+        if (!this.isMatching51JobDetailUrl(candidateUrl, { expectedUrl, platformJobId })) return;
+        settled = true;
+        cleanup();
+        resolve({ tabId, url: candidateUrl, reusedSearchTab });
+      };
+
+      const handleCreated = (tab) => {
+        if (!tab) return;
+        maybeResolve(tab.id, tab.pendingUrl || tab.url || '', false);
+      };
+
+      const handleUpdated = (tabId, changeInfo, tab) => {
+        const candidateUrl = changeInfo.url || tab?.pendingUrl || tab?.url || '';
+        if (tabId === searchTabId) {
+          maybeResolve(tabId, candidateUrl, true);
+          return;
+        }
+        maybeResolve(tabId, candidateUrl, false);
+      };
+
+      const scanTabs = async () => {
+        if (settled) return;
+        if (searchTabId) {
+          const searchTab = await chrome.tabs.get(searchTabId).catch(() => null);
+          if (searchTab) {
+            await maybeResolve(searchTabId, searchTab.pendingUrl || searchTab.url || '', true);
+            if (settled) return;
+          }
+        }
+
+        const tabs = await chrome.tabs.query({}).catch(() => []);
+        for (const tab of tabs) {
+          if (!tab || !Number.isFinite(tab.id)) continue;
+          if (knownIds.has(tab.id)) continue;
+          await maybeResolve(tab.id, tab.pendingUrl || tab.url || '', false);
+          if (settled) return;
+        }
+      };
+
+      timeoutId = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Timed out waiting for 51job detail tab from search tab ${searchTabId}`));
+      }, timeoutMs);
+
+      chrome.tabs.onCreated.addListener(handleCreated);
+      chrome.tabs.onUpdated.addListener(handleUpdated);
+      intervalId = setInterval(() => {
+        scanTabs().catch(() => null);
+      }, 500);
+      scanTabs().catch(() => null);
+    });
+
+    return {
+      promise,
+      cancel: () => {
+        if (cleanupRef) cleanupRef();
+      }
+    };
+  }
+
+  extract51JobPlatformJobId(job) {
+    if (job && job.platformJobId) {
+      return String(job.platformJobId).trim();
+    }
+    const url = job && job.url ? String(job.url) : '';
+    const match = url.match(/\/(\d+)\.html/i);
+    return match ? match[1] : '';
+  }
+
+  async fetch51JobDetailViaListClick(searchTabId, job) {
+    const platformJobId = this.extract51JobPlatformJobId(job);
+    if (!searchTabId || !platformJobId) {
+      return null;
+    }
+
+    const existingTabs = await chrome.tabs.query({}).catch(() => []);
+    const detailTabWaiter = this.waitFor51JobDetailTab(searchTabId, {
+      expectedUrl: job.url || '',
+      platformJobId,
+      knownTabIds: existingTabs.map((tab) => tab && tab.id).filter(Number.isFinite),
+      timeoutMs: 35000
+    });
+    let clickResponse = null;
+    try {
+      clickResponse = await this.sendTabMessageWithRetry(searchTabId, {
+        type: 'OPEN_JOB_DETAIL_FROM_LIST',
+        jobId: platformJobId
+      });
+    } catch (error) {
+      detailTabWaiter.cancel();
+      throw error;
+    }
+
+    if (!clickResponse || !clickResponse.success) {
+      detailTabWaiter.cancel();
+      throw new Error(clickResponse?.error || `Failed to open 51job detail from list for ${platformJobId}`);
+    }
+
+    const detailTab = await detailTabWaiter.promise;
+    await this.waitForTabComplete(detailTab.tabId, 20000);
+    await this.sleep(6000);
+    await this.waitForContentScript(detailTab.tabId, 8);
+
+    const response = await this.sendTabMessageWithRetry(detailTab.tabId, { type: 'GET_JOB_DETAIL' });
+    return {
+      response,
+      tabId: detailTab.tabId,
+      reusedSearchTab: detailTab.reusedSearchTab
+    };
+  }
+
+  async recover51JobSearchTab(searchTabId) {
+    if (!searchTabId) return;
+    try {
+      await chrome.tabs.goBack(searchTabId);
+      await this.sleep(5000);
+      await this.waitForTabComplete(searchTabId, 15000);
+      await this.waitForContentScript(searchTabId, 6);
+    } catch (error) {
+      console.warn(`[51job] Failed to recover search tab ${searchTabId}: ${error.message}`);
+    }
+  }
+
+  async enrich51JobDetails(pageJobs, { budget, interval, searchTabId = null }) {
+    const targetJobs = pageJobs.filter(job => job && job.url && (!job.description || !job.description.trim())).slice(0, budget);
+    let consumed = 0;
+
+    for (const job of targetJobs) {
+      if (!this.isRunning) break;
+
+      let tabId = null;
+      let reusedSearchTab = false;
+      let response = null;
+      try {
+        if (searchTabId) {
+          try {
+            const clickResult = await this.fetch51JobDetailViaListClick(searchTabId, job);
+            if (clickResult) {
+              tabId = clickResult.tabId;
+              reusedSearchTab = clickResult.reusedSearchTab;
+              response = clickResult.response;
+            }
+          } catch (clickError) {
+            console.warn(`[51job] 列表点击详情失败 (${this.extract51JobPlatformJobId(job)}): ${clickError.message}`);
+          }
+        }
+
+        if (!response) {
+          const tab = await this.createTabWithRetry({ url: job.url, active: false });
+          tabId = tab.id;
+          reusedSearchTab = false;
+          await this.sleep(4000);
+          response = await this.sendTabMessageWithRetry(tabId, { type: 'GET_JOB_DETAIL' });
+        }
+
+        if ((!response || response.code === 'ANTI_BOT') && tabId) {
+          const currentTab = await chrome.tabs.get(tabId).catch(() => null);
+          const currentUrl = currentTab?.url || job.url;
+          const verificationResult = await this.waitForManualVerification({
+            platform: '51job',
+            sourceTabId: tabId,
+            currentUrl,
+            duplicateFromSource: reusedSearchTab
+          });
+
+          if (reusedSearchTab) {
+            await this.recover51JobSearchTab(searchTabId);
+            reusedSearchTab = false;
+          }
+
+          if (verificationResult && verificationResult.verified) {
+            tabId = verificationResult.validationTabId || tabId;
+            await this.waitForTabComplete(tabId, 20000).catch(() => null);
+            await this.sleep(3000);
+            response = await this.sendTabMessageWithRetry(tabId, { type: 'GET_JOB_DETAIL' }).catch(() => null);
+          }
+        }
+
+        if (response && response.success && response.data && response.data.description) {
+          job.description = response.data.description;
+          if (response.data.location) job.location = job.location || response.data.location;
+          if (response.data.salary) job.salary = job.salary || response.data.salary;
+          if (response.data.education) job.education = job.education || response.data.education;
+          if (response.data.experience) job.experience = job.experience || response.data.experience;
+          if (response.data.keywords) job.keywords = job.keywords || response.data.keywords;
+          job.detailStatus = 'success';
+          job.detailErrorCode = '';
+        } else if (response && response.success && response.data) {
+          job.detailStatus = 'empty';
+          job.detailErrorCode = 'empty_description';
+        } else {
+          const detailCode = response && response.code ? String(response.code) : '';
+          if (detailCode === 'ANTI_BOT') {
+            job.detailStatus = 'anti_bot';
+            job.detailErrorCode = 'anti_bot';
+          } else if (detailCode === 'NO_DATA' || detailCode === 'NO_VALID_DATA') {
+            job.detailStatus = 'empty';
+            job.detailErrorCode = detailCode.toLowerCase();
+          } else {
+            job.detailStatus = 'error';
+            job.detailErrorCode = detailCode ? detailCode.toLowerCase() : 'detail_fetch_failed';
+          }
+        }
+      } catch (error) {
+        console.warn(`[51job] 详情补抓失败 (${job.url}): ${error.message}`);
+        job.detailStatus = 'error';
+        job.detailErrorCode = 'detail_fetch_exception';
+      } finally {
+        if (tabId) {
+          if (reusedSearchTab) {
+            await this.recover51JobSearchTab(searchTabId);
+          } else {
+            try { await chrome.tabs.remove(tabId); } catch (e) { /* ignore */ }
+          }
+        }
+      }
+
+      consumed++;
+      if (interval > 0) {
+        await this.sleep(interval);
+      }
+    }
+
+    return { consumed };
+  }
+
+  /**
+   * 智联招聘专用采集流程（分页调度版）
+   * 通过 crawl_page_tasks 表驱动 p1→pN 分页
+   *
+   * 分页调度逻辑:
+   * 1. 为每个 city + keyword 组合创建 crawl_page_tasks 记录（status = pending）
+   * 2. 逐页执行：按页码排序查询 status = pending 的任务
+   * 3. 每页：更新 status = running → 打开标签页采集 → 更新 status = done
+   * 4. 页终止条件（满足任一即停止翻页）：
+   *    - 空页：当前页返回 0 条岗位
+   *    - 高重复率：当前页新岗位占比 < 10%
+   *    - 连续无新：连续 2 页无任何新岗位
+   *    - 硬上限：单次任务最多翻 MAX_LIST_PAGES 页（默认 1）
+   *
+   * 与 Boss / 51job 完全独立，互不干扰
+   *
+   * @returns {Object} { success, totalJobs, cityDetails, jobs }
+   */
+  async executeZhaopinCrawl(options = {}) {
+    // 智联招聘城市编码（与 content-zhaopin.js 保持一致）
+    const cityCatalog = [
+      { code: '530', name: '北京' },
+      { code: '538', name: '上海' },
+      { code: '765', name: '深圳' },
+      { code: '653', name: '杭州' },
+      { code: '763', name: '广州' },
+      { code: '801', name: '成都' },
+      { code: '635', name: '南京' },
+      { code: '736', name: '武汉' },
+      { code: '854', name: '西安' },
+      { code: '636', name: '苏州' }
+    ];
+    const requestedCity = typeof options.city === 'string' ? options.city.trim() : '';
+    const requestedKeyword = typeof options.keyword === 'string' ? options.keyword.trim() : '';
+    const cities = requestedCity
+      ? cityCatalog.filter((item) => item.name === requestedCity)
+      : cityCatalog.filter((item) => ['北京', '上海', '深圳', '杭州'].includes(item.name));
+    const keywords = requestedKeyword ? [requestedKeyword] : (CONFIG.KEYWORDS || ['AI产品经理']);
+    const allJobs = [];
+    const cityDetails = [];
+
+    // 分页配置（均从 runtime_config 读取，可配置化）
+    const maxPages = this.getMaxListPages();
+    const detailBudget = this.getDetailBudgetPerRun();
+    const detailInterval = this.getDetailRequestIntervalMs();
+
+    // 详情降级计数器
+    let consecutiveDetailFailCount = 0;
+    let detailDegraded = false;
+
+    console.log(
+      `[zhaopin] 开始采集: ${cities.length} 城市 x ${keywords.length} 关键词, ` +
+      `maxPages=${maxPages}, detailBudget=${detailBudget}, detailInterval=${detailInterval}ms`
+    );
+
+    if (cities.length === 0) {
+      return {
+        success: false,
+        totalJobs: 0,
+        cityDetails: [],
+        jobs: [],
+        error: `不支持的智联城市: ${requestedCity}`
+      };
+    }
+
+    for (const city of cities) {
+      for (const keyword of keywords) {
+        // 检查是否被用户停止
+        if (!this.isRunning) {
+          console.log('[zhaopin] 采集被用户中断');
+          break;
+        }
+
+        const crawlResult = await this._zhaopinCrawlCityKeyword(city, keyword, {
+          maxPages, detailBudget, detailInterval
+        });
+
+        if (crawlResult.jobs.length > 0) {
+          allJobs.push(...crawlResult.jobs);
+        }
+        cityDetails.push(crawlResult.detail);
+      }
+
+      // 外层中断检查
+      if (!this.isRunning) break;
+    }
+
+    // ===== 详情 backlog 消费（列表采集完成后） =====
+    let detailBacklogConsumed = 0;
+    let detailBacklogSuccess = 0;
+
+    if (detailBudget > 0 && this.isRunning) {
+      try {
+        const backlogResult = await this._zhaopinConsumeDetailBacklog({
+          budget: detailBudget,
+          interval: detailInterval,
+          onFail: () => { consecutiveDetailFailCount++; },
+          onSuccess: () => { consecutiveDetailFailCount = 0; },
+          shouldStop: () => consecutiveDetailFailCount >= 2 || !this.isRunning
+        });
+        detailBacklogConsumed = backlogResult.consumed;
+        detailBacklogSuccess = backlogResult.successCount;
+
+        if (consecutiveDetailFailCount >= 2) {
+          detailDegraded = true;
+          console.warn(
+            `[Zhaopin] Detail degradation triggered after ${consecutiveDetailFailCount} consecutive failures`
+          );
+        }
+      } catch (err) {
+        console.warn(`[zhaopin] Detail backlog consumption error: ${err.message}`);
+      }
+    }
+
+    console.log(
+      `[zhaopin] 采集完成: 共 ${allJobs.length} 条职位, ` +
+      `详情补抓 consumed=${detailBacklogConsumed} success=${detailBacklogSuccess}` +
+      (detailDegraded ? ' [DEGRADED]' : '')
+    );
+
+    return {
+      success: true,
+      totalJobs: allJobs.length,
+      cityDetails,
+      jobs: allJobs,
+      detailBacklogConsumed,
+      detailBacklogSuccess,
+      detailDegraded
+    };
+  }
+
+  /**
+   * 执行单个 city + keyword 的分页采集
+   *
+   * 调度流程：
+   * 1. 通过控制面 API 创建 p1 ~ pN 页码任务
+   * 2. 逐页查询 pending 任务 → 标记 running → 采集 → 标记 done
+   * 3. 每页采集后检查终止条件
+   *
+   * @param {Object} city - { code, name }
+   * @param {string} keyword - 搜索关键词
+   * @param {Object} config - { maxPages, detailBudget, detailInterval }
+   * @returns {Object} { jobs: Array, detail: Object }
+   */
+  async _zhaopinCrawlCityKeyword(city, keyword, config) {
+    const { maxPages } = config;
+    const jobs = [];
+    let consecutiveNoNewPages = 0;
+    let totalFound = 0;
+    let totalNew = 0;
+    let effectiveMaxPages = maxPages;
+
+    const pageTaskResolution = await this._resolveZhaopinPageTasks(city, keyword, maxPages);
+    let pendingTasks = pageTaskResolution.tasks;
+    const usingControllerPageTasks = pageTaskResolution.usingController;
+
+    // 按 page_number 排序
+    pendingTasks.sort((a, b) => a.page_number - b.page_number);
+
+    for (let taskIndex = 0; taskIndex < pendingTasks.length; taskIndex++) {
+      // 检查是否被用户停止
+      if (!this.isRunning) {
+        console.log('[zhaopin] 分页采集中断');
+        break;
+      }
+
+      const task = pendingTasks[taskIndex];
+      const pageNum = task.page_number;
+
+      // 2a. 标记为 running
+      if (usingControllerPageTasks && task.id) {
+        try {
+          await fetch(`${CONFIG.CONTROLLER_BASE_URL}/api/page-tasks/update`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: task.id, status: 'running' })
+          });
+        } catch (err) {
+          console.warn(`[zhaopin] 更新任务状态失败 (task#${task.id}): ${err.message}`);
+        }
+      }
+
+      // 2b. 构建翻页 URL 并采集
+      const searchUrl = `https://www.zhaopin.com/sou/jl${city.code}/kw${encodeURIComponent(keyword)}/p${pageNum}`;
+      let tabId = null;
+      let pageJobs = [];
+      let pageError = null;
+      let pageMeta = null;
+
+      try {
+        const tab = await chrome.tabs.create({ url: searchUrl, active: false });
+        tabId = tab.id;
+        console.log(`[zhaopin] 打开标签页 ${tabId}: ${city.name} - ${keyword} - p${pageNum}`);
+
+        // 等待页面加载 + content script 注入
+        await this.sleep(5000);
+
+        const response = await chrome.tabs.sendMessage(tabId, { type: 'SCRAPE_JOBS' });
+
+        if (response && response.success && response.data && response.data.length > 0) {
+          pageJobs = response.data;
+          pageMeta = response.pagination || null;
+          console.log(`[zhaopin] ${city.name} ${keyword} p${pageNum}: 采集 ${pageJobs.length} 条`);
+        } else {
+          pageError = response ? (response.error || '无数据') : '无响应';
+          pageMeta = response && response.pagination ? response.pagination : null;
+          console.warn(`[zhaopin] ${city.name} ${keyword} p${pageNum}: ${pageError}`);
+        }
+
+        // 更新运行时统计
+        this.runStats.pagesFetched++;
+      } catch (err) {
+        pageError = err.message;
+        console.warn(`[zhaopin] ${city.name} ${keyword} p${pageNum} 采集失败: ${err.message}`);
+      }
+
+      // 关闭标签页
+      if (tabId) {
+        try { await chrome.tabs.remove(tabId); } catch (e) { /* 忽略 */ }
+      }
+
+      // 2c. 入库并统计新/重
+      let inserted = 0;
+      let duplicated = 0;
+      if (pageJobs.length > 0) {
+        try {
+          const insertResult = await this.reportJobsToController(pageJobs, 'zhaopin');
+          inserted = insertResult.inserted || 0;
+          duplicated = insertResult.duplicates || 0;
+        } catch (err) {
+          console.warn(`[zhaopin] 入库失败: ${err.message}`);
+        }
+        jobs.push(...pageJobs);
+      }
+
+      totalFound += pageJobs.length;
+      totalNew += inserted;
+
+      if (!usingControllerPageTasks && pageMeta && Number.isInteger(pageMeta.totalPages) && pageMeta.totalPages > effectiveMaxPages) {
+        const previousMaxPages = effectiveMaxPages;
+        effectiveMaxPages = pageMeta.totalPages;
+        for (let nextPage = previousMaxPages + 1; nextPage <= effectiveMaxPages; nextPage++) {
+          pendingTasks.push({
+            id: null,
+            page_number: nextPage,
+            source: 'auto-pagination'
+          });
+        }
+        pendingTasks.sort((a, b) => a.page_number - b.page_number);
+        console.log(
+          `[zhaopin] 检测到真实分页 ${pageMeta.totalPages} 页，已从 ${previousMaxPages} 页扩展到 ${effectiveMaxPages} 页`
+        );
+      }
+
+      // 2d. 更新任务状态为 done
+      if (usingControllerPageTasks && task.id) {
+        try {
+          await fetch(`${CONFIG.CONTROLLER_BASE_URL}/api/page-tasks/update`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: task.id,
+              status: 'done',
+              jobsFound: pageJobs.length,
+              jobsNew: inserted
+            })
+          });
+        } catch (err) {
+          console.warn(`[zhaopin] 更新任务完成状态失败 (task#${task.id}): ${err.message}`);
+        }
+      }
+
+      // 2e. 检查页终止条件
+      const stopReason = this._checkPageStopCondition(pageJobs, inserted, consecutiveNoNewPages, pageNum, effectiveMaxPages);
+      if (stopReason) {
+        console.log(`[zhaopin] 页终止条件触发: ${stopReason} (p${pageNum})`);
+        break;
+      }
+
+      // 更新连续无新计数
+      if (inserted === 0) {
+        consecutiveNoNewPages++;
+      } else {
+        consecutiveNoNewPages = 0;
+      }
+
+      // 防反爬间隔
+      const delay = 5000 + Math.random() * 3000;
+      await this.sleep(delay);
+    }
+
+    return {
+      jobs,
+      detail: {
+        city: city.name,
+        keyword,
+        count: jobs.length,
+        totalFound,
+        totalNew
+      }
+    };
+  }
+
+  async _resolve51jobPageTasks(city, keyword, maxPages) {
+    const localTasks = Array.from({ length: maxPages }, (_, index) => ({
+      id: null,
+      page_number: index + 1,
+      source: 'local-fallback'
+    }));
+
+    let controllerApiAvailable = true;
+
+    for (let p = 1; p <= maxPages; p++) {
+      try {
+        const resp = await fetch(`${CONFIG.CONTROLLER_BASE_URL}/api/page-tasks/create`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            platform: '51job',
+            city: city.name,
+            keyword,
+            pageNumber: p
+          })
+        });
+
+        if (!resp.ok) {
+          controllerApiAvailable = false;
+          console.warn(`[51job] page-tasks/create unavailable (${resp.status}), fallback to local pagination`);
+          break;
+        }
+
+        const result = await resp.json();
+        if (!result.success) {
+          controllerApiAvailable = false;
+          console.warn(`[51job] page-tasks/create returned failure (${result.error || 'unknown'}), fallback to local pagination`);
+          break;
+        }
+      } catch (err) {
+        controllerApiAvailable = false;
+        console.warn(`[51job] 创建页码任务失败: ${err.message}, fallback to local pagination`);
+        break;
+      }
+    }
+
+    if (!controllerApiAvailable) {
+      return { usingController: false, tasks: localTasks };
+    }
+
+    try {
+      const pendingResp = await fetch(
+        `${CONFIG.CONTROLLER_BASE_URL}/api/page-tasks/pending?platform=51job&city=${encodeURIComponent(city.name)}&keyword=${encodeURIComponent(keyword)}&limit=${maxPages}`
+      );
+
+      if (!pendingResp.ok) {
+        console.warn(`[51job] page-tasks/pending unavailable (${pendingResp.status}), fallback to local pagination`);
+        return { usingController: false, tasks: localTasks };
+      }
+
+      const pendingResult = await pendingResp.json();
+      const pendingTasks = pendingResult.success ? (pendingResult.tasks || []) : [];
+
+      if (pendingTasks.length === 0) {
+        console.warn(`[51job] No pending page tasks for ${city.name}/${keyword}, fallback to local pagination`);
+        return { usingController: false, tasks: localTasks };
+      }
+
+      return { usingController: true, tasks: pendingTasks };
+    } catch (err) {
+      console.warn(`[51job] 查询待执行页码任务失败: ${err.message}, fallback to local pagination`);
+      return { usingController: false, tasks: localTasks };
+    }
+  }
+
+  async _resolveZhaopinPageTasks(city, keyword, maxPages) {
+    const localTasks = Array.from({ length: maxPages }, (_, index) => ({
+      id: null,
+      page_number: index + 1,
+      source: 'local-fallback'
+    }));
+
+    let controllerApiAvailable = true;
+
+    for (let p = 1; p <= maxPages; p++) {
+      try {
+        const resp = await fetch(`${CONFIG.CONTROLLER_BASE_URL}/api/page-tasks/create`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            platform: 'zhaopin',
+            city: city.name,
+            keyword,
+            pageNumber: p
+          })
+        });
+
+        if (!resp.ok) {
+          controllerApiAvailable = false;
+          console.warn(
+            `[zhaopin] page-tasks/create unavailable (${resp.status}), fallback to local pagination`
+          );
+          break;
+        }
+
+        const result = await resp.json();
+        if (!result.success) {
+          controllerApiAvailable = false;
+          console.warn(
+            `[zhaopin] page-tasks/create returned failure (${result.error || 'unknown'}), fallback to local pagination`
+          );
+          break;
+        }
+      } catch (err) {
+        controllerApiAvailable = false;
+        console.warn(`[zhaopin] 创建页码任务失败: ${err.message}, fallback to local pagination`);
+        break;
+      }
+    }
+
+    if (!controllerApiAvailable) {
+      return { usingController: false, tasks: localTasks };
+    }
+
+    try {
+      const pendingResp = await fetch(
+        `${CONFIG.CONTROLLER_BASE_URL}/api/page-tasks/pending?platform=zhaopin&city=${encodeURIComponent(city.name)}&keyword=${encodeURIComponent(keyword)}&limit=${maxPages}`
+      );
+
+      if (!pendingResp.ok) {
+        console.warn(
+          `[zhaopin] page-tasks/pending unavailable (${pendingResp.status}), fallback to local pagination`
+        );
+        return { usingController: false, tasks: localTasks };
+      }
+
+      const pendingResult = await pendingResp.json();
+      const pendingTasks = pendingResult.success ? (pendingResult.tasks || []) : [];
+
+      if (pendingTasks.length === 0) {
+        console.warn(
+          `[zhaopin] No pending page tasks for ${city.name}/${keyword}, fallback to local pagination`
+        );
+        return { usingController: false, tasks: localTasks };
+      }
+
+      return { usingController: true, tasks: pendingTasks };
+    } catch (err) {
+      console.warn(`[zhaopin] 查询待执行页码任务失败: ${err.message}, fallback to local pagination`);
+      return { usingController: false, tasks: localTasks };
+    }
+  }
+
+  /**
+   * 检查分页终止条件
+   *
+   * 终止条件（满足任一即返回停止原因）：
+   * - 空页：当前页返回 0 条岗位
+   * - 高重复率：当前页新岗位占比 < 10%（且至少有 5 条以上数据才有意义）
+   * - 连续无新：连续 2 页无任何新岗位
+   * - 硬上限：已达最大页数
+   *
+   * @param {Array} pageJobs - 当前页采集到的职位
+   * @param {number} inserted - 当前页新入库的职位数
+   * @param {number} consecutiveNoNewPages - 已连续无新页数
+   * @param {number} currentPage - 当前页码
+   * @param {number} maxPages - 最大页数
+   * @returns {string|null} 终止原因，null 表示继续翻页
+   */
+  _checkPageStopCondition(pageJobs, inserted, consecutiveNoNewPages, currentPage, maxPages) {
+    // 空页：当前页 0 条岗位
+    if (pageJobs.length === 0) {
+      return '空页: 当前页返回 0 条岗位';
+    }
+
+    // 高重复率：新岗位占比 < 10%
+    if (currentPage > 1 && pageJobs.length >= 5) {
+      const newRatio = inserted / pageJobs.length;
+      if (newRatio < 0.1) {
+        return `高重复率: 新岗位占比 ${(newRatio * 100).toFixed(1)}% < 10%`;
+      }
+    }
+
+    // 连续无新：连续 2 页无新岗位
+    if (consecutiveNoNewPages >= 2) {
+      return `连续无新: 已连续 ${consecutiveNoNewPages} 页无新岗位`;
+    }
+
+    // 硬上限：已达到最大页数
+    if (currentPage >= maxPages) {
+      return `硬上限: 已达最大页数 ${maxPages}`;
+    }
+
+    return null;
+  }
+
+  /**
+   * 消费智联详情 backlog 队列
+   *
+   * 从控制器 API 获取待补详情的岗位列表，逐个打开详情页抓取正文，
+   * 更新 detail_status。支持连续失败自动降级。
+   *
+   * @param {Object} config
+   * @param {number} config.budget - 本轮详情预算（最大补抓数）
+   * @param {number} config.interval - 详情请求间隔（毫秒）
+   * @param {Function} config.onFail - 单次失败回调
+   * @param {Function} config.onSuccess - 单次成功回调
+   * @param {Function} config.shouldStop - 是否应停止消费（降级检查）
+   * @returns {Object} { consumed, successCount }
+   */
+  async _zhaopinConsumeDetailBacklog({ budget, interval, onFail, onSuccess, shouldStop }) {
+    let consumed = 0;
+    let successCount = 0;
+
+    if (budget <= 0) return { consumed: 0, successCount: 0 };
+
+    // 从控制器 API 获取 backlog 队列
+    let backlogJobs = [];
+    try {
+      const resp = await fetch(
+        `${CONFIG.CONTROLLER_BASE_URL}/api/jobs/detail-backlog?platform=zhaopin&limit=${budget}`
+      );
+      const result = await resp.json();
+      if (result.success && Array.isArray(result.jobs)) {
+        backlogJobs = result.jobs;
+      }
+    } catch (err) {
+      console.warn(`[zhaopin] Failed to fetch detail backlog: ${err.message}`);
+      return { consumed: 0, successCount: 0 };
+    }
+
+    if (backlogJobs.length === 0) {
+      console.log('[zhaopin] Detail backlog is empty, nothing to consume');
+      return { consumed: 0, successCount: 0 };
+    }
+
+    console.log(`[zhaopin] Detail backlog: ${backlogJobs.length} jobs to process (budget=${budget})`);
+
+    for (const job of backlogJobs) {
+      // 降级检查
+      if (shouldStop()) {
+        console.log(`[zhaopin] Detail backlog stopped early (degradation or user stop)`);
+        break;
+      }
+
+      if (!job.url) {
+        console.warn(`[zhaopin] Skipping backlog job without URL: ${job.platformJobId}`);
+        continue;
+      }
+
+      let tabId = null;
+      let detailResponse = null;
+
+      try {
+        const tab = await chrome.tabs.create({ url: job.url, active: false });
+        tabId = tab.id;
+        console.log(`[zhaopin] Detail backlog: opening ${job.platformJobId} (${tabId})`);
+
+        // 等待详情页加载
+        await this.sleep(5000);
+
+        detailResponse = await chrome.tabs.sendMessage(tabId, { type: 'GET_JOB_DETAIL' });
+      } catch (err) {
+        console.warn(`[zhaopin] Detail backlog fetch failed for ${job.platformJobId}: ${err.message}`);
+        detailResponse = null;
+      }
+
+      // 关闭标签页
+      if (tabId) {
+        try { await chrome.tabs.remove(tabId); } catch (e) { /* 忽略 */ }
+      }
+
+      // 解析详情结果并更新状态
+      const updatePayload = {
+        platform: 'zhaopin',
+        platformJobId: job.platformJobId
+      };
+
+      if (detailResponse && detailResponse.success && detailResponse.detailStatus === 'success') {
+        // 详情成功
+        updatePayload.detailStatus = 'success';
+        updatePayload.description = detailResponse.data?.description || '';
+        successCount++;
+        if (onSuccess) onSuccess();
+        console.log(`[zhaopin] Detail backlog success: ${job.platformJobId}`);
+      } else if (detailResponse && detailResponse.detailStatus === 'anti_bot') {
+        // 风控拦截
+        updatePayload.detailStatus = 'anti_bot';
+        updatePayload.errorCode = detailResponse.detailErrorCode || 'anti_bot';
+        if (onFail) onFail();
+        console.warn(`[zhaopin] Detail backlog anti_bot: ${job.platformJobId}`);
+      } else if (detailResponse && detailResponse.detailStatus === 'empty') {
+        // 正文为空
+        updatePayload.detailStatus = 'empty';
+        updatePayload.errorCode = detailResponse.detailErrorCode || 'empty_content';
+        if (onFail) onFail();
+        console.warn(`[zhaopin] Detail backlog empty: ${job.platformJobId}`);
+      } else if (detailResponse && !detailResponse.success) {
+        // 解析失败
+        updatePayload.detailStatus = 'error';
+        updatePayload.errorCode = detailResponse.detailErrorCode || detailResponse.code || 'unknown_error';
+        if (onFail) onFail();
+        console.warn(`[zhaopin] Detail backlog error: ${job.platformJobId} - ${detailResponse.error}`);
+      } else {
+        // 无响应（标签页打开失败等）
+        updatePayload.detailStatus = 'error';
+        updatePayload.errorCode = 'no_response';
+        if (onFail) onFail();
+        console.warn(`[zhaopin] Detail backlog no response: ${job.platformJobId}`);
+      }
+
+      // 通过控制器 API 更新 detail_status
+      try {
+        await fetch(`${CONFIG.CONTROLLER_BASE_URL}/api/jobs/detail-status-update`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updatePayload)
+        });
+      } catch (err) {
+        console.warn(`[zhaopin] Failed to update detail status for ${job.platformJobId}: ${err.message}`);
+      }
+
+      consumed++;
+
+      // 间隔等待
+      if (consumed < backlogJobs.length && !shouldStop()) {
+        const jitter = Math.random() * 1000;
+        await this.sleep(interval + jitter);
+      }
+    }
+
+    return { consumed, successCount };
+  }
+
   // ============ 反爬自适应策略 ============
-  
+
   // 检测是否是反爬错误
   isAntiCrawlError(errorMessage) {
     if (!errorMessage) return false;
@@ -2214,3 +4306,20 @@ class JobHunterService {
 
 // 启动服务
 const service = new JobHunterService();
+
+// ============ 平台爬虫路由 ============
+const scrapers = {
+  boss: (data) => {
+    service.pushToFeishu(Array.isArray(data) ? data : [data]);
+  },
+  '51job': (data) => {
+    const jobs = Array.isArray(data) ? data : [data];
+    console.log(`[路由] 51job 数据已接收，共 ${jobs.length} 条，写入 scraped_jobs`);
+    service.reportJobsToController(jobs, '51job');
+  },
+  zhaopin: (data) => {
+    const jobs = Array.isArray(data) ? data : [data];
+    console.log(`[路由] 智联招聘数据已接收，共 ${jobs.length} 条，写入 scraped_jobs`);
+    service.reportJobsToController(jobs, 'zhaopin');
+  }
+};

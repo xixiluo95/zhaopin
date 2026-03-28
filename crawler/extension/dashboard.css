@@ -1,0 +1,2108 @@
+/* ============================================
+   Dashboard 样式 - Constructivism（构成主义）重写
+   色彩体系：Constructivism 6色
+   与 popup.css 保持一致的设计语言
+   ============================================ */
+
+/* === CSS 变量 === */
+:root {
+    --c-red: #E62B1E;
+    --c-black: #1A1A1A;
+    --c-paper: #F4F0EA;
+    --c-yellow: #FFC72C;
+    --c-gray: #8E8E8E;
+    --c-white: #FFFFFF;
+    --c-text-primary: #1A1A1A;
+    --c-text-secondary: #8E8E8E;
+    --border-heavy: 3px solid var(--c-black);
+}
+
+/* === 全局重置 === */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans SC', sans-serif;
+    background: var(--c-paper);
+    color: var(--c-text-primary);
+    min-height: 100vh;
+    position: relative;
+}
+
+/* === 基础排版 === */
+h1, h2, h3, h4, h5, h6 {
+    font-family: 'Courier New', monospace;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-weight: 900;
+}
+
+/* ========================================
+   导航栏 - Constructivism 风格
+   ======================================== */
+
+#main-nav {
+    background: var(--c-black);
+    border-bottom: 4px solid var(--c-red);
+    padding: 0;
+    display: flex;
+    gap: 0;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 9999;
+}
+
+.nav-tab {
+    color: var(--c-paper);
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 700;
+    padding: 14px 28px;
+    display: flex;
+    align-items: center;
+    position: relative;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-family: 'Courier New', monospace;
+    border-right: 2px solid #333;
+    transition: background 0.15s, color 0.15s;
+    border-radius: 0;
+}
+
+.nav-tab:hover {
+    background: var(--c-red);
+    color: var(--c-white);
+}
+
+.nav-tab.active {
+    background: var(--c-red);
+    color: var(--c-white);
+    border-right-color: var(--c-red);
+}
+
+/* === 视图容器 === */
+#view-home,
+#view-resume {
+    padding: 24px;
+    min-height: calc(100vh - 48px);
+    padding-top: 52px;
+    position: relative;
+}
+
+/* ========================================
+   Toast 提示 - Constructivism 风格
+   ======================================== */
+
+/* 入场动画（对齐设计稿 .anim / .vis） */
+.anim {
+    opacity: 0;
+    transform: translateY(30px);
+    transition: opacity 0.5s ease-out, transform 0.5s ease-out;
+}
+
+.anim.vis {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+/* 大字背景装饰（对齐设计稿 .vlabel） */
+.vlabel {
+    position: absolute;
+    top: 70px;
+    right: 30px;
+    font-size: 120px;
+    font-weight: 900;
+    color: rgba(26, 26, 26, 0.04);
+    z-index: 0;
+    letter-spacing: -5px;
+    pointer-events: none;
+    font-family: 'Courier New', monospace;
+}
+
+/* 视图切换器（批次视图 / 全库视图） */
+.view-head {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 20px;
+}
+
+.view-head__top {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.view-switcher {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.view-switcher__btn {
+    background: transparent;
+    color: var(--c-black);
+    border: 2px solid var(--c-black);
+    padding: 7px 16px;
+    font-size: 10px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.view-switcher__btn:hover:not(:disabled) {
+    background: var(--c-yellow);
+    color: var(--c-black);
+    border-color: var(--c-yellow);
+}
+.view-switcher__btn--active {
+    background: var(--c-red);
+    color: var(--c-white);
+    border-color: var(--c-red);
+    cursor: default;
+}
+
+.res-btn--clear {
+    background: var(--c-black);
+    color: var(--c-paper);
+    border-color: var(--c-black);
+    flex-shrink: 0;
+}
+
+.res-btn--clear:hover {
+    background: var(--c-red);
+    color: var(--c-white);
+    border-color: var(--c-red);
+}
+
+.batch-sync {
+    width: min(420px, 100%);
+    margin-left: auto;
+    border: 2px solid var(--c-black);
+    background: var(--c-paper);
+    padding: 10px 12px;
+}
+
+.batch-sync__meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 10px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+}
+
+.batch-sync__track {
+    height: 8px;
+    background: rgba(26, 26, 26, 0.12);
+    border: 1px solid var(--c-black);
+}
+
+.batch-sync__bar {
+    height: 100%;
+    background: var(--c-red);
+}
+
+#toast-container {
+    position: fixed;
+    top: 60px;
+    right: 20px;
+    z-index: 9998;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.toast {
+    padding: 12px 20px;
+    border-radius: 0;
+    font-size: 13px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border: 2px solid var(--c-black);
+    animation: toast-slide-in 300ms ease-out;
+    max-width: 360px;
+    min-width: 200px;
+}
+
+.toast--error {
+    background: var(--c-black);
+    color: var(--c-yellow);
+    border: 2px solid var(--c-yellow);
+}
+
+.toast--success {
+    background: var(--c-red);
+    color: var(--c-white);
+    border: 2px solid var(--c-black);
+}
+
+.toast--info {
+    background: var(--c-yellow);
+    color: var(--c-black);
+    border: 2px solid var(--c-black);
+}
+
+.toast.fade-out {
+    animation: toast-slide-out 300ms ease-out forwards;
+}
+
+@keyframes toast-slide-in {
+    from { transform: translateX(100%); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
+}
+
+@keyframes toast-slide-out {
+    from { transform: translateX(0); opacity: 1; }
+    to { transform: translateX(100%); opacity: 0; }
+}
+
+/* ========================================
+   Suprematism 4 列网格布局
+   ======================================== */
+
+.job-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 4px;
+    background: var(--c-black);
+}
+
+@media (max-width: 1000px) {
+    .job-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (max-width: 600px) {
+    .job-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* 8 色 nth-child 循环（对齐设计稿） */
+/* 8n+1: 红色背景，白色文字，跨2行 */
+.job-grid .card:nth-child(8n+1) { background: var(--c-red); color: var(--c-white); grid-row: span 2; min-height: 380px; }
+/* 8n+2: 米白背景，黑色文字 */
+.job-grid .card:nth-child(8n+2) { background: var(--c-paper); color: var(--c-black); }
+/* 8n+3: 黑色背景，米白文字 */
+.job-grid .card:nth-child(8n+3) { background: var(--c-black); color: var(--c-paper); }
+/* 8n+4: 黄色背景，黑色文字，跨2列 */
+.job-grid .card:nth-child(8n+4) { background: var(--c-yellow); color: var(--c-black); grid-column: span 2; }
+/* 8n+5: 米白背景，黑色文字 */
+.job-grid .card:nth-child(8n+5) { background: var(--c-paper); color: var(--c-black); }
+/* 8n+6: 红色背景，白色文字 */
+.job-grid .card:nth-child(8n+6) { background: var(--c-red); color: var(--c-white); }
+/* 8n+7: 黑色背景，米白文字 */
+.job-grid .card:nth-child(8n+7) { background: var(--c-black); color: var(--c-paper); }
+/* 8n+8: 米白背景，黑色文字，跨2行 */
+.job-grid .card:nth-child(8n+8) { background: var(--c-paper); color: var(--c-black); grid-row: span 2; min-height: 380px; }
+
+/* 响应式：小屏幕取消跨列 */
+@media (max-width: 1000px) {
+    .job-grid .card:nth-child(8n+4) { grid-column: span 1; }
+}
+
+/* SVG 图形填充色适配各卡片背景（对齐设计稿 L47-L50） */
+/* 红色/白色背景卡片 → 白色 SVG */
+.job-grid .card:nth-child(8n+1) .card__fig svg *,
+.job-grid .card:nth-child(8n+6) .card__fig svg * { fill: #fff; stroke: #fff; }
+/* 黑色背景卡片 → 黄色 SVG */
+.job-grid .card:nth-child(8n+3) .card__fig svg *,
+.job-grid .card:nth-child(8n+7) .card__fig svg * { fill: var(--c-yellow); stroke: var(--c-yellow); }
+/* 黄色背景卡片 → 黑色 SVG */
+.job-grid .card:nth-child(8n+4) .card__fig svg * { fill: var(--c-black); stroke: var(--c-black); }
+/* 米白背景卡片 → 红色 SVG */
+.job-grid .card:nth-child(8n+2) .card__fig svg *,
+.job-grid .card:nth-child(8n+5) .card__fig svg *,
+.job-grid .card:nth-child(8n+8) .card__fig svg * { fill: var(--c-red); stroke: var(--c-red); }
+
+/* nth-child 色彩适配：标题、元信息、薪资 */
+.job-grid .card:nth-child(8n+1) .card__title,
+.job-grid .card:nth-child(8n+6) .card__title { color: var(--c-white); }
+
+.job-grid .card:nth-child(8n+3) .card__title,
+.job-grid .card:nth-child(8n+7) .card__title { color: var(--c-paper); }
+
+.job-grid .card:nth-child(8n+1) .card__meta,
+.job-grid .card:nth-child(8n+1) .card__meta span,
+.job-grid .card:nth-child(8n+6) .card__meta,
+.job-grid .card:nth-child(8n+6) .card__meta span { color: var(--c-white); }
+
+.job-grid .card:nth-child(8n+3) .card__meta,
+.job-grid .card:nth-child(8n+3) .card__meta span,
+.job-grid .card:nth-child(8n+7) .card__meta,
+.job-grid .card:nth-child(8n+7) .card__meta span {
+    color: rgba(244, 240, 234, 0.92);
+    opacity: 1;
+}
+
+.job-grid .card:nth-child(8n+1) .card__sal,
+.job-grid .card:nth-child(8n+6) .card__sal { color: var(--c-white); }
+
+.job-grid .card:nth-child(8n+3) .card__sal,
+.job-grid .card:nth-child(8n+7) .card__sal { color: var(--c-paper); }
+
+/* nth-child 色彩适配：平台标签（对齐设计稿 L61-L64） */
+/* 米白背景卡片 → 黑色底米白字 */
+.job-grid .card:nth-child(8n+2) .card__plat,
+.job-grid .card:nth-child(8n+5) .card__plat,
+.job-grid .card:nth-child(8n+8) .card__plat { background: var(--c-black); color: var(--c-paper); }
+/* 红色/黑色背景卡片 → 半透明白色底 */
+.job-grid .card:nth-child(8n+1) .card__plat,
+.job-grid .card:nth-child(8n+3) .card__plat,
+.job-grid .card:nth-child(8n+7) .card__plat { background: rgba(255, 255, 255, 0.2); color: var(--c-white); }
+/* 红色背景(8n+6) → 黑色底黄色字 */
+.job-grid .card:nth-child(8n+6) .card__plat { background: var(--c-black); color: var(--c-yellow); }
+/* 黄色背景卡片 → 黑色底黄色字 */
+.job-grid .card:nth-child(8n+4) .card__plat { background: var(--c-black); color: var(--c-yellow); }
+
+/* nth-child 色彩适配：标签（对齐设计稿 L65-L67） */
+/* 红色背景卡片 → 半透明白色底 */
+.job-grid .card:nth-child(8n+1) .card__tag,
+.job-grid .card:nth-child(8n+6) .card__tag { background: rgba(255, 255, 255, 0.15); color: var(--c-white); }
+/* 黑色背景卡片 → 半透明黄色底 */
+.job-grid .card:nth-child(8n+3) .card__tag,
+.job-grid .card:nth-child(8n+7) .card__tag { background: rgba(255, 199, 44, 0.2); color: var(--c-yellow); }
+/* 黄色背景卡片 → 半透明黑色底 */
+.job-grid .card:nth-child(8n+4) .card__tag { background: rgba(26, 26, 26, 0.12); color: var(--c-black); }
+
+/* SVG 图形容器 */
+.card__fig {
+    position: absolute;
+    bottom: 0;
+    right: 0;
+    width: 55%;
+    height: 65%;
+    opacity: 0.10;
+    z-index: 2;
+    pointer-events: none;
+}
+
+.card__fig svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+/* 卡片编号（右上角装饰） */
+.card__num {
+    font-size: 48px;
+    font-weight: 900;
+    opacity: 0.06;
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    line-height: 1;
+    pointer-events: none;
+    z-index: 1;
+}
+
+/* ========================================
+   Job 卡片 - Constructivism 网格卡片
+   ======================================== */
+
+.card {
+    background: var(--c-paper);
+    border: none;
+    padding: 24px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    position: relative;
+    overflow: hidden;
+    transition: filter 0.15s;
+    border-radius: 0;
+    box-shadow: none;
+    color: var(--c-black);
+}
+
+.card:hover {
+    filter: brightness(1.08);
+}
+
+.card__head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    position: relative;
+    z-index: 3;
+}
+
+.card__title {
+    font-size: 15px;
+    font-weight: 800;
+    color: var(--c-black);
+    line-height: 1.35;
+    flex: 1;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.card__plat {
+    padding: 3px 8px;
+    border-radius: 0;
+    font-size: 10px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--c-white);
+    flex-shrink: 0;
+    line-height: 1.4;
+}
+
+.card__meta {
+    font-size: 12px;
+    opacity: .7;
+    margin-top: auto;
+    position: relative;
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.card__sal {
+    font-weight: 900;
+    font-size: 20px;
+    opacity: 1!important;
+    line-height: 1.2;
+}
+
+.card__tags {
+    display: flex;
+    gap: 5px;
+    flex-wrap: wrap;
+    margin-top: 4px;
+}
+
+.card__tag {
+    background: var(--c-black);
+    padding: 2px 7px;
+    border-radius: 0;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--c-white);
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    line-height: 1.4;
+}
+
+/* ========================================
+   居中弹窗 - Constructivism 风格
+   ======================================== */
+
+.exov {
+    position: fixed;
+    inset: 0;
+    background: rgba(26, 26, 26, 0.85);
+    z-index: 5000;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.25s;
+}
+
+.exov.on {
+    display: flex;
+    opacity: 1;
+}
+
+.expanel {
+    background: var(--c-paper);
+    border: 4px solid var(--c-black);
+    width: 46%;
+    max-width: 680px;
+    max-height: 82vh;
+    overflow-y: auto;
+    position: relative;
+    transform: scale(0.92);
+    opacity: 0;
+    transition: transform 0.3s cubic-bezier(0.1, 0.9, 0.2, 1), opacity 0.25s;
+}
+
+.exov.on .expanel {
+    transform: scale(1);
+    opacity: 1;
+}
+
+.expanel::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 8px;
+    background: var(--c-red);
+    z-index: 1;
+}
+
+.exclose {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+    width: 40px;
+    height: 40px;
+    background: var(--c-red);
+    color: var(--c-white);
+    border: none;
+    font-size: 22px;
+    font-weight: 900;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2;
+}
+
+.exbody {
+    padding: 36px 36px 28px;
+}
+
+.extitle {
+    font-size: 22px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding-right: 48px;
+    margin-bottom: 14px;
+    line-height: 1.3;
+}
+
+.exsal {
+    font-size: 30px;
+    font-weight: 900;
+    color: var(--c-red);
+    margin-bottom: 16px;
+    line-height: 1;
+}
+
+.exinfo {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 16px;
+}
+
+.exinfo-i {
+    font-size: 12px;
+    font-weight: 700;
+    padding: 4px 12px;
+    background: var(--c-black);
+    color: var(--c-paper);
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    line-height: 1.4;
+}
+
+.extags {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+}
+
+.extag {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 3px 10px;
+    background: var(--c-red);
+    color: var(--c-white);
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+}
+
+.exdesc {
+    font-size: 14px;
+    line-height: 1.8;
+    padding: 20px 0;
+    border-top: 3px solid var(--c-black);
+    border-bottom: 3px solid var(--c-black);
+    max-height: 180px;
+    overflow-y: auto;
+}
+
+.exacts {
+    padding-top: 20px;
+    display: flex;
+    gap: 12px;
+}
+
+.bep {
+    padding: 13px 28px;
+    font-weight: 800;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    cursor: pointer;
+    border: none;
+}
+
+.bep--p {
+    background: var(--c-red);
+    color: var(--c-white);
+}
+
+.bep--s {
+    background: transparent;
+    color: var(--c-black);
+    border: 3px solid var(--c-black);
+}
+
+.bep--disabled {
+    opacity: 0.45;
+    cursor: default;
+    pointer-events: none;
+}
+
+/* 响应式 */
+@media (max-width: 900px) {
+    .expanel {
+        width: 90%;
+    }
+}
+
+/* ========================================
+   全局按钮 - Constructivism 风格
+   ======================================== */
+
+button {
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+button:not(:disabled):hover {
+    transform: none;
+}
+
+button:not(:disabled):active {
+    transform: none;
+}
+
+a {
+    transition: color 0.15s;
+}
+
+/* ========================================
+   空态 & 加载态
+   ======================================== */
+
+.empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--c-text-secondary);
+    font-size: 14px;
+    font-family: 'Courier New', monospace;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    font-weight: 700;
+    animation: fade-in 400ms ease-out;
+}
+
+/* 后端不可达引导态 */
+.empty-state--backend {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 200px;
+}
+
+.empty-state--backend h3 {
+    font-size: 16px;
+    color: var(--c-red);
+    margin-bottom: 12px;
+    letter-spacing: 1px;
+}
+
+.empty-state--backend p {
+    font-size: 13px;
+    color: var(--c-text-secondary);
+    margin-bottom: 20px;
+    text-transform: none;
+    letter-spacing: 0;
+}
+
+.empty-state--backend code {
+    background: var(--c-black);
+    color: var(--c-paper);
+    padding: 2px 8px;
+    font-size: 12px;
+}
+
+.empty-state--backend .res-btn {
+    margin-top: 4px;
+}
+
+@keyframes fade-in {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.loading {
+    text-align: center;
+    padding: 40px;
+    color: var(--c-text-secondary);
+    font-size: 14px;
+    font-family: 'Courier New', monospace;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 0.6; }
+    50% { opacity: 1; }
+}
+
+/* ========================================
+   M10-N2-WP1: 第二页布局（由 .ws 控制分屏）
+   ======================================== */
+
+#view-resume {
+    padding: 0;
+    min-height: calc(100vh - 48px);
+    padding-top: 52px;
+}
+
+/* ========================================
+   上传区域 - Constructivism 风格
+   ======================================== */
+
+.upload-zone {
+    border: 3px solid #444;
+    padding: 40px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.15s;
+    color: var(--c-paper);
+    background: transparent;
+    border-radius: 0;
+}
+
+.upload-zone:hover {
+    border-color: var(--c-yellow);
+}
+
+.upload-zone.drag-over {
+    border-color: var(--c-red);
+}
+
+.upload-zone__icon {
+    font-size: 32px;
+    margin-bottom: 8px;
+    display: block;
+}
+
+.upload-zone__text {
+    font-size: 14px;
+    line-height: 1.6;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-weight: 700;
+}
+
+.upload-zone__hint {
+    font-size: 12px;
+    color: var(--c-gray);
+    margin-top: 4px;
+}
+
+.upload-zone input[type="file"] {
+    display: none;
+}
+
+/* ========================================
+   简历信息
+   ======================================== */
+
+.resume-info {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.resume-info__name {
+    font-size: 16px;
+    font-weight: 900;
+    color: var(--c-paper);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: 'Courier New', monospace;
+    text-transform: uppercase;
+}
+
+.resume-info__name::before {
+    content: '';
+    display: inline-block;
+    width: 6px;
+    height: 18px;
+    background: var(--c-red);
+    border-radius: 0;
+}
+
+.resume-info__meta {
+    font-size: 13px;
+    color: var(--c-gray);
+}
+
+.resume-info__actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 4px;
+}
+
+.btn-reupload {
+    background: var(--c-yellow);
+    color: var(--c-black);
+    border: none;
+    padding: 7px 16px;
+    border-radius: 0;
+    font-size: 10px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+
+.btn-reupload:hover {
+    background: var(--c-red);
+    color: var(--c-white);
+}
+
+.btn-disabled {
+    background: var(--c-gray);
+    color: var(--c-white);
+    border: none;
+    padding: 7px 16px;
+    border-radius: 0;
+    font-size: 10px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    cursor: not-allowed;
+    opacity: 0.7;
+}
+
+.btn-disabled:hover {
+    transform: none;
+    background: var(--c-gray);
+}
+
+/* ========================================
+   M10-N2-WP1: 工作台分屏布局
+   ======================================== */
+
+.ws {
+    display: grid;
+    grid-template-columns: 7fr 3fr;
+    gap: 0;
+    background: var(--c-black);
+    min-height: 600px;
+}
+
+@media (max-width: 900px) {
+    .ws {
+        grid-template-columns: 1fr;
+    }
+}
+
+.ws-del {
+    background: var(--c-paper);
+    padding: 28px;
+    border-right: 4px solid var(--c-black);
+}
+
+.ws-del__title {
+    font-size: 20px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 20px;
+    padding-bottom: 12px;
+    border-bottom: 4px solid var(--c-red);
+}
+
+.ws-del__count {
+    font-size: 12px;
+    font-weight: 800;
+    background: var(--c-black);
+    color: var(--c-paper);
+    padding: 2px 8px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.ws-res {
+    background: var(--c-black);
+    color: var(--c-paper);
+    padding: 28px;
+    overflow-y: auto;
+    max-height: calc(100vh - 56px);
+}
+
+.ws-res__title {
+    font-size: 20px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 4px solid var(--c-yellow);
+}
+
+/* ========================================
+   收藏列表容器
+   ======================================== */
+
+.delivery-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+}
+
+/* ========================================
+   ws-item - 投递列表项（对齐设计稿）
+   ======================================== */
+
+.ws-item {
+    border: 3px solid var(--c-black);
+    padding: 16px;
+    margin-bottom: 12px;
+    background: var(--c-white);
+    cursor: pointer;
+    transition: background 0.1s;
+}
+
+.ws-item:hover {
+    background: var(--c-yellow);
+}
+
+.ws-item:nth-child(even) {
+    background: var(--c-black);
+    color: var(--c-paper);
+}
+
+.ws-item:nth-child(even):hover {
+    background: var(--c-red);
+    color: var(--c-white);
+}
+
+.ws-item:nth-child(even) .ws-i2 {
+    opacity: 0.7;
+}
+
+.ws-item:nth-child(even) .ws-badge {
+    background: var(--c-yellow);
+    color: var(--c-black);
+}
+
+/* 主行：标题 + 平台标签 */
+.ws-item-main {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+/* 标题 */
+.ws-i1 {
+    font-weight: 800;
+    font-size: 14px;
+}
+
+/* 副标题（公司 · 城市） */
+.ws-i2 {
+    font-size: 12px;
+    opacity: 0.6;
+    margin-top: 4px;
+}
+
+/* 平台标签 */
+.ws-badge {
+    font-size: 10px;
+    font-weight: 800;
+    padding: 4px 10px;
+    background: var(--c-red);
+    color: var(--c-white);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    flex-shrink: 0;
+}
+
+/* 展开详情区域 */
+.ws-item-detail {
+    padding: 12px 0 4px;
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    border-top: 2px solid var(--c-black);
+    margin-top: 12px;
+}
+
+.delivery-detail__info {
+    flex: 1;
+    min-width: 0;
+}
+
+.ws-item-detail p {
+    font-size: 13px;
+    color: var(--c-text-secondary);
+}
+
+.ws-item:nth-child(even) .ws-item-detail {
+    border-top-color: #444;
+}
+
+.delivery-detail__actions {
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+    margin-top: 0;
+    justify-content: flex-end;
+}
+
+.btn-cancel-select {
+    background: none;
+    border: 2px solid var(--c-red);
+    color: var(--c-red);
+    padding: 6px 14px;
+    border-radius: 0;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+
+.btn-cancel-select:hover {
+    background: var(--c-red);
+    color: var(--c-white);
+}
+
+.btn-ai-match {
+    background: none;
+    border: 2px solid var(--c-gray);
+    color: var(--c-gray);
+    padding: 6px 14px;
+    border-radius: 0;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    cursor: not-allowed;
+    opacity: 0.6;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.btn-ai-match:disabled:hover {
+    transform: none;
+    background: none;
+    color: var(--c-gray);
+}
+
+/* ========================================
+   简历结构化内容（工作台右侧）
+   ======================================== */
+
+.rsec {
+    margin-bottom: 18px;
+    padding-bottom: 14px;
+    border-bottom: 2px solid #333;
+}
+
+.rsec:last-child {
+    border-bottom: none;
+}
+
+.rsec-hd {
+    font-size: 13px;
+    font-weight: 900;
+    text-transform: uppercase;
+    color: var(--c-yellow);
+    letter-spacing: 1.5px;
+    margin-bottom: 10px;
+    padding-bottom: 5px;
+    border-bottom: 3px solid var(--c-yellow);
+    display: inline-block;
+}
+
+.rsec-name {
+    font-size: 20px;
+    font-weight: 900;
+    text-transform: uppercase;
+    line-height: 1.2;
+    margin-bottom: 3px;
+    font-family: 'Courier New', monospace;
+}
+
+.rsec-role {
+    font-size: 13px;
+    font-weight: 700;
+    opacity: 0.85;
+    margin-bottom: 2px;
+}
+
+.rsec-sub {
+    font-size: 11px;
+    opacity: 0.5;
+    margin-bottom: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.rsec-list {
+    list-style: none;
+    padding: 0;
+}
+
+.rsec-list li {
+    font-size: 12px;
+    line-height: 1.7;
+    opacity: 0.85;
+    padding: 2px 0 2px 14px;
+    position: relative;
+}
+
+.rsec-list li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 10px;
+    width: 6px;
+    height: 3px;
+    background: var(--c-yellow);
+}
+
+.rsec-contact {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    font-size: 12px;
+    opacity: 0.8;
+    line-height: 1.6;
+}
+
+/* ========================================
+   编辑/预览按钮栏
+   ======================================== */
+
+.res-bar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.res-btn {
+    background: var(--c-yellow);
+    color: var(--c-black);
+    border: 2px solid transparent;
+    padding: 7px 16px;
+    font-size: 10px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.res-btn:hover {
+    background: var(--c-red);
+    color: var(--c-white);
+}
+
+.res-btn:focus-visible {
+    outline: 2px solid var(--c-yellow);
+    outline-offset: 2px;
+}
+
+.res-btn--g {
+    background: transparent;
+    color: var(--c-yellow);
+    border: 2px solid var(--c-yellow);
+}
+
+.res-btn--g:hover {
+    background: var(--c-yellow);
+    color: var(--c-black);
+}
+
+.res-btn--active {
+    background: var(--c-red);
+    color: var(--c-white);
+    border-color: var(--c-red);
+}
+
+/* ========================================
+   上传按钮（工作台内）
+   ======================================== */
+
+.upload-btn {
+    display: block;
+    width: 100%;
+    margin-top: 16px;
+    padding: 14px;
+    background: transparent;
+    color: var(--c-paper);
+    border: 3px solid #444;
+    font-size: 12px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+}
+
+.upload-btn:hover {
+    border-color: var(--c-yellow);
+    color: var(--c-yellow);
+}
+
+/* ========================================
+   Textarea 编辑区
+   ======================================== */
+
+.res-edit {
+    display: none;
+}
+
+.res-edit.on {
+    display: block;
+}
+
+.res-ta {
+    width: 100%;
+    min-height: 400px;
+    background: #2a2a2a;
+    color: var(--c-paper);
+    border: 3px solid #444;
+    padding: 16px;
+    font-size: 13px;
+    font-family: 'Courier New', monospace;
+    line-height: 1.7;
+    resize: vertical;
+    border-radius: 0;
+}
+
+.res-ta:focus {
+    outline: none;
+    border-color: var(--c-yellow);
+}
+
+/* ========================================
+   下载栏
+   ======================================== */
+
+.dl-bar {
+    display: flex;
+    gap: 10px;
+    margin-top: 16px;
+    align-items: center;
+    padding-top: 16px;
+    border-top: 2px solid #333;
+}
+
+.dl-sel {
+    background: #333;
+    color: var(--c-paper);
+    border: 2px solid #555;
+    padding: 8px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: inherit;
+}
+
+.dl-sel:focus {
+    outline: none;
+    border-color: var(--c-yellow);
+}
+
+.dl-btn {
+    background: var(--c-red);
+    color: var(--c-white);
+    border: none;
+    padding: 8px 18px;
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    cursor: pointer;
+}
+
+/* ========================================
+   AI 配置
+   ======================================== */
+
+.aicfg {
+    margin-top: 16px;
+    padding: 18px;
+    border: 2px solid #444;
+    display: none;
+}
+
+.aicfg.on {
+    display: block;
+}
+
+.aicfg h4 {
+    font-size: 12px;
+    font-weight: 900;
+    text-transform: uppercase;
+    color: var(--c-yellow);
+    letter-spacing: 1px;
+    margin-bottom: 12px;
+}
+
+.aif {
+    margin-bottom: 10px;
+}
+
+.aif label {
+    display: block;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: var(--c-gray);
+    letter-spacing: 0.5px;
+    margin-bottom: 3px;
+}
+
+.aiinp {
+    width: 100%;
+    background: #2a2a2a;
+    color: var(--c-paper);
+    border: 2px solid #444;
+    padding: 9px 12px;
+    font-size: 13px;
+    font-family: 'Courier New', monospace;
+}
+
+.aiinp:focus {
+    outline: none;
+    border-color: var(--c-yellow);
+}
+
+.aiinp::placeholder {
+    color: #555;
+}
+
+/* ========================================
+   滚动条样式 - Constructivism
+   ======================================== */
+
+::-webkit-scrollbar {
+    width: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--c-paper);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--c-red);
+    border: 2px solid var(--c-black);
+}
+
+/* ========================================
+   N3 WP4: 简历双模式编辑
+   ======================================== */
+
+/* 双模式容器 */
+.resume-dual-mode {
+    width: 100%;
+}
+
+/* 无简历时的简化界面 */
+.resume-no-content {
+    text-align: center;
+    padding: 40px 20px;
+}
+
+.resume-no-content__text {
+    font-size: 14px;
+    font-family: 'Courier New', monospace;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: var(--c-gray);
+    margin-bottom: 20px;
+    font-weight: 700;
+}
+
+.upload-btn-simple {
+    background: transparent;
+    color: var(--c-paper);
+    border: 3px solid #444;
+    padding: 14px 32px;
+    font-size: 12px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: border-color 0.15s, color 0.15s;
+}
+
+.upload-btn-simple:hover {
+    border-color: var(--c-yellow);
+    color: var(--c-yellow);
+}
+
+/* 简历内容为空提示 */
+.resume-empty {
+    text-align: center;
+    padding: 30px 20px;
+    font-size: 13px;
+    font-family: 'Courier New', monospace;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--c-gray);
+}
+
+/* 结构化 HTML 中的段落文本 */
+.rsec-text {
+    font-size: 13px;
+    line-height: 1.7;
+    opacity: 0.85;
+    margin-bottom: 6px;
+}
+
+/* 查看模式下的内容区域 */
+.resume-dual-mode__view {
+    animation: fade-in 300ms ease-out;
+}
+
+/* 编辑模式下的内容区域 */
+.resume-dual-mode__edit {
+    animation: fade-in 300ms ease-out;
+}
+
+/* ========================================
+   M8-N3-WP3: AI 配置面板
+   ======================================== */
+
+.ai-config-panel {
+    max-width: 560px;
+    margin: 0 auto;
+    padding: 32px 24px;
+}
+
+.ai-config-panel__title {
+    font-size: 20px;
+    font-weight: 900;
+    font-family: 'Courier New', monospace;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--c-black);
+    padding-bottom: 12px;
+    border-bottom: 4px solid var(--c-red);
+    margin-bottom: 24px;
+}
+
+.ai-config-panel__body {
+    background: var(--c-white);
+    border: 3px solid var(--c-black);
+    padding: 24px;
+}
+
+.ai-config-field {
+    margin-bottom: 16px;
+}
+
+.ai-config-field:last-of-type {
+    margin-bottom: 20px;
+}
+
+.ai-config-field__label {
+    display: block;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: var(--c-gray);
+    letter-spacing: 1px;
+    margin-bottom: 4px;
+    font-family: 'Courier New', monospace;
+}
+
+.ai-config-field__input,
+.ai-config-field__select {
+    width: 100%;
+    background: var(--c-paper);
+    color: var(--c-black);
+    border: 2px solid var(--c-black);
+    padding: 10px 12px;
+    font-size: 13px;
+    font-family: 'Courier New', monospace;
+    border-radius: 0;
+    box-shadow: none;
+    transition: border-color 0.15s;
+}
+
+.ai-config-field__input:focus,
+.ai-config-field__select:focus {
+    outline: none;
+    border-color: var(--c-red);
+}
+
+.ai-config-field__input::placeholder {
+    color: var(--c-gray);
+}
+
+.ai-config-field__select {
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpolygon points='0,0 6,8 12,0' fill='%231A1A1A'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+    padding-right: 36px;
+}
+
+.ai-config-field__hint {
+    display: block;
+    font-size: 11px;
+    color: var(--c-gray);
+    margin-top: 3px;
+    font-family: 'Courier New', monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.ai-config-panel__actions {
+    padding-top: 8px;
+    border-top: 3px solid var(--c-black);
+    margin-top: 4px;
+}
+
+.ai-config-panel__btn {
+    border: none;
+    padding: 12px 28px;
+    font-size: 12px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    cursor: pointer;
+    font-family: 'Courier New', monospace;
+    border-radius: 0;
+    box-shadow: none;
+    transition: background 0.15s, color 0.15s;
+}
+
+.ai-config-panel__btn--save {
+    background: var(--c-red);
+    color: var(--c-white);
+}
+
+.ai-config-panel__btn--save:hover:not(:disabled) {
+    background: var(--c-black);
+    color: var(--c-white);
+}
+
+.ai-config-panel__btn--save:disabled {
+    background: var(--c-gray);
+    cursor: not-allowed;
+}
+
+/* 响应式 */
+@media (max-width: 600px) {
+    .ai-config-panel {
+        padding: 20px 16px;
+    }
+
+    .ai-config-panel__body {
+        padding: 16px;
+    }
+}
+
+/* ========================================
+   M8-N3-WP4: AI 功能交互按钮
+   ======================================== */
+
+/* AI 优化简历按钮 - 简历编辑工具栏 */
+.res-btn--ai {
+    background: var(--c-black);
+    color: var(--c-yellow);
+    border: 2px solid var(--c-yellow);
+    position: relative;
+}
+
+.res-btn--ai:hover:not(:disabled) {
+    background: var(--c-red);
+    color: var(--c-white);
+    border-color: var(--c-red);
+}
+
+.res-btn--ai:disabled {
+    background: #444;
+    color: #666;
+    border-color: #555;
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+/* AI 按钮加载状态 */
+.res-btn--ai.is-loading,
+.btn-ai-match.is-loading {
+    opacity: 0.7;
+    pointer-events: none;
+}
+
+/* AI 智能匹配按钮 - 收藏列表（已配置 AI 时激活） */
+.btn-ai-match:not(:disabled) {
+    background: none;
+    border: 2px solid var(--c-red);
+    color: var(--c-red);
+    padding: 6px 14px;
+    border-radius: 0;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    opacity: 1;
+}
+
+.btn-ai-match:not(:disabled):hover {
+    background: var(--c-red);
+    color: var(--c-white);
+    transform: none;
+}
+
+/* AI 匹配分数标签 */
+.ai-match-score {
+    display: inline-block;
+    padding: 4px 12px;
+    font-size: 11px;
+    font-weight: 800;
+    font-family: 'Courier New', monospace;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    background: var(--c-yellow);
+    color: var(--c-black);
+    border: 2px solid var(--c-black);
+    animation: fade-in 300ms ease-out;
+}
+
+/* ========================================
+   M9-N1-WP1: 导出下拉菜单 - Constructivism 风格
+   ======================================== */
+
+/* 导出按钮容器（相对定位，供下拉菜单绝对定位参考） */
+.export-dropdown {
+    position: relative;
+    display: inline-block;
+}
+
+/* 导出按钮 */
+.res-btn--export {
+    background: var(--c-yellow);
+    color: var(--c-black);
+    border-color: var(--c-yellow);
+}
+
+.res-btn--export:hover:not(:disabled) {
+    background: var(--c-red);
+    color: var(--c-white);
+}
+
+.res-btn--export:disabled {
+    background: #444;
+    color: #666;
+    border-color: #555;
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+/* 导出下拉菜单 */
+.export-menu {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin-top: 3px;
+    background: var(--c-white);
+    border: 3px solid var(--c-black);
+    z-index: 50;
+    min-width: 200px;
+}
+
+.export-menu.is-visible {
+    display: block;
+    animation: fade-in 150ms ease-out;
+}
+
+.export-menu button {
+    display: block;
+    width: 100%;
+    padding: 10px 16px;
+    border: none;
+    border-bottom: 1px solid var(--c-black);
+    background: var(--c-white);
+    color: var(--c-black);
+    text-align: left;
+    cursor: pointer;
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    transition: background 0.1s, color 0.1s;
+}
+
+.export-menu button:last-child {
+    border-bottom: none;
+}
+
+.export-menu button:hover {
+    background: var(--c-red);
+    color: var(--c-white);
+}
+
+/* ========================================
+   M10-N3: 50/50 分屏布局
+   ======================================== */
+
+/* M13-N4-WP1: 分屏限定在工作台区域，不参与文档流 */
+.split {
+    display: none;
+    position: absolute;
+    top: 52px; /* 导航栏高度 */
+    left: 0;
+    right: 0;
+    height: calc(100vh - 52px);
+    overflow: hidden;
+    background: var(--c-black);
+    z-index: 100;
+}
+
+.split.on {
+    display: flex;
+}
+
+.spane {
+    flex: 1 1 50%;
+    height: 100%;
+    overflow-y: auto;
+    padding: 28px;
+}
+
+.spane::-webkit-scrollbar {
+    width: 10px;
+}
+
+.spane::-webkit-scrollbar-track {
+    background: var(--c-paper);
+}
+
+.spane::-webkit-scrollbar-thumb {
+    background: var(--c-red);
+    border: 2px solid var(--c-black);
+}
+
+.sp-l {
+    background: var(--c-paper);
+    border-right: 6px solid var(--c-black);
+}
+
+.sp-r {
+    background: var(--c-black);
+    color: var(--c-paper);
+}
+
+.sp-l h2 {
+    font-size: 22px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 12px;
+    padding-bottom: 12px;
+    border-bottom: 4px solid var(--c-red);
+    line-height: 1.3;
+}
+
+.sp-sal {
+    font-size: 28px;
+    font-weight: 900;
+    color: var(--c-red);
+    margin-bottom: 14px;
+    line-height: 1;
+}
+
+.sp-meta {
+    font-size: 13px;
+    opacity: 0.6;
+    margin-bottom: 6px;
+    line-height: 1.4;
+}
+
+.sp-desc {
+    font-size: 14px;
+    line-height: 1.8;
+    padding: 16px 0;
+    border-top: 3px solid var(--c-black);
+    border-bottom: 3px solid var(--c-black);
+    margin-top: 14px;
+}
+
+.sp-tags {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 14px;
+}
+
+.sp-tag {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 3px 10px;
+    background: var(--c-black);
+    color: var(--c-paper);
+    text-transform: uppercase;
+}
+
+.sp-acts {
+    margin-top: 24px;
+    display: flex;
+    gap: 12px;
+}
+
+.btn-back {
+    background: var(--c-black);
+    color: var(--c-paper);
+    border: none;
+    padding: 12px 24px;
+    font-weight: 800;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    cursor: pointer;
+}
+
+.sp-r h3 {
+    font-size: 20px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 4px solid var(--c-yellow);
+}
+
+/* ========================================
+   M11-N2: 采集控制面板
+   ======================================== */
+
+#view-crawl {
+    padding: 24px;
+    min-height: calc(100vh - 48px);
+    padding-top: 52px;
+    position: relative;
+}
+
+.crawl-panel__title {
+    font-size: 20px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 4px solid var(--c-red);
+    font-family: 'Courier New', monospace;
+}
+
+.crawl-panel__body {
+    background: var(--c-white);
+    border: 3px solid var(--c-black);
+    padding: 20px;
+    max-width: 560px;
+}
+
+.crawl-field {
+    margin-bottom: 14px;
+}
+
+.crawl-field label {
+    display: block;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: var(--c-gray);
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.crawl-select,
+.crawl-input {
+    width: 100%;
+    background: var(--c-paper);
+    color: var(--c-black);
+    border: 2px solid var(--c-black);
+    padding: 10px 12px;
+    font-size: 13px;
+    font-family: inherit;
+    border-radius: 0;
+}
+
+.crawl-select:focus,
+.crawl-input:focus {
+    outline: none;
+    border-color: var(--c-red);
+}
+
+.crawl-select {
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpolygon points='0,0 6,8 12,0' fill='%231A1A1A'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+    padding-right: 36px;
+}
+
+.crawl-input::placeholder {
+    color: var(--c-gray);
+}
+
+.crawl-panel__actions {
+    display: flex;
+    gap: 10px;
+    padding-top: 8px;
+    border-top: 3px solid var(--c-black);
+    margin-top: 4px;
+}
+
+.crawl-panel__actions .res-btn {
+    flex: 1;
+    text-align: center;
+    padding: 10px 16px;
+    font-size: 11px;
+}
+
+.crawl-status {
+    margin-top: 12px;
+}
+
+.crawl-status__text {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--c-gray);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+}
+
+.verify-ov {
+    position: fixed;
+    inset: 0;
+    z-index: 7000;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(26, 26, 26, 0.78);
+}
+
+.verify-panel {
+    width: min(520px, calc(100vw - 32px));
+    background: var(--c-paper);
+    border: 4px solid var(--c-black);
+    position: relative;
+}
+
+.verify-panel::before {
+    content: '';
+    display: block;
+    height: 8px;
+    background: var(--c-yellow);
+    border-bottom: 3px solid var(--c-black);
+}
+
+.verify-panel__title {
+    padding: 18px 22px 0;
+    font-size: 20px;
+    font-family: 'Courier New', monospace;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.verify-panel__body {
+    padding: 18px 22px 22px;
+}
+
+.verify-panel__text {
+    font-size: 14px;
+    line-height: 1.7;
+    color: var(--c-black);
+}
+
+.verify-panel__hint {
+    margin-top: 10px;
+    font-size: 12px;
+    color: var(--c-gray);
+    line-height: 1.6;
+    text-transform: none;
+}
+
+.verify-panel__actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 18px;
+}
+
+.verify-panel__actions .res-btn {
+    flex: 1;
+}
+
+.crawl-progress {
+    height: 6px;
+    background: var(--c-paper);
+    border: 2px solid var(--c-black);
+    overflow: hidden;
+}
+
+.crawl-progress__bar {
+    height: 100%;
+    background: var(--c-red);
+    transition: width 0.3s;
+}
+
+/* 采集面板大字装饰 */
+.crawl-panel__label {
+    position: absolute;
+    top: 70px;
+    right: 30px;
+    font-size: 120px;
+    font-weight: 900;
+    color: rgba(26, 26, 26, 0.04);
+    z-index: 0;
+    letter-spacing: -5px;
+    pointer-events: none;
+    font-family: 'Courier New', monospace;
+}
+
+/* 响应式 */
+@media (max-width: 600px) {
+    .crawl-panel__body {
+        padding: 16px;
+    }
+}
