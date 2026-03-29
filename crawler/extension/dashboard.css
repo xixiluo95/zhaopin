@@ -10,6 +10,7 @@
     --c-black: #1A1A1A;
     --c-paper: #F4F0EA;
     --c-yellow: #FFC72C;
+    --c-blue: #2F5DA9;
     --c-gray: #8E8E8E;
     --c-white: #FFFFFF;
     --c-text-primary: #1A1A1A;
@@ -269,116 +270,85 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 /* ========================================
-   Suprematism 4 列网格布局
+   Suprematism 网格布局 - 蒙德里安引擎驱动
    ======================================== */
 
 .job-grid {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-auto-rows: 190px;
     gap: 4px;
     background: var(--c-black);
 }
 
-@media (max-width: 1000px) {
-    .job-grid {
-        grid-template-columns: repeat(2, 1fr);
-    }
+/* === data-tone 主题色驱动（替代 nth-child） === */
+
+/* 红色主题 */
+.job-grid .card[data-tone="red"] {
+    background: var(--c-red);
+    color: var(--c-white);
+    --card-fig-color: var(--c-white);
+    --card-plat-bg: var(--c-black);
+    --card-plat-fg: var(--c-yellow);
+    --card-tag-bg: rgba(255, 255, 255, 0.15);
+    --card-tag-fg: var(--c-white);
 }
 
-@media (max-width: 600px) {
-    .job-grid {
-        grid-template-columns: 1fr;
-    }
+/* 黄色主题 */
+.job-grid .card[data-tone="yellow"] {
+    background: var(--c-yellow);
+    color: var(--c-black);
+    --card-fig-color: var(--c-black);
+    --card-plat-bg: var(--c-black);
+    --card-plat-fg: var(--c-yellow);
+    --card-tag-bg: rgba(26, 26, 26, 0.12);
+    --card-tag-fg: var(--c-black);
 }
 
-/* 8 色 nth-child 循环（对齐设计稿） */
-/* 8n+1: 红色背景，白色文字，跨2行 */
-.job-grid .card:nth-child(8n+1) { background: var(--c-red); color: var(--c-white); grid-row: span 2; min-height: 380px; }
-/* 8n+2: 米白背景，黑色文字 */
-.job-grid .card:nth-child(8n+2) { background: var(--c-paper); color: var(--c-black); }
-/* 8n+3: 黑色背景，米白文字 */
-.job-grid .card:nth-child(8n+3) { background: var(--c-black); color: var(--c-paper); }
-/* 8n+4: 黄色背景，黑色文字，跨2列 */
-.job-grid .card:nth-child(8n+4) { background: var(--c-yellow); color: var(--c-black); grid-column: span 2; }
-/* 8n+5: 米白背景，黑色文字 */
-.job-grid .card:nth-child(8n+5) { background: var(--c-paper); color: var(--c-black); }
-/* 8n+6: 红色背景，白色文字 */
-.job-grid .card:nth-child(8n+6) { background: var(--c-red); color: var(--c-white); }
-/* 8n+7: 黑色背景，米白文字 */
-.job-grid .card:nth-child(8n+7) { background: var(--c-black); color: var(--c-paper); }
-/* 8n+8: 米白背景，黑色文字，跨2行 */
-.job-grid .card:nth-child(8n+8) { background: var(--c-paper); color: var(--c-black); grid-row: span 2; min-height: 380px; }
-
-/* 响应式：小屏幕取消跨列 */
-@media (max-width: 1000px) {
-    .job-grid .card:nth-child(8n+4) { grid-column: span 1; }
+/* 蓝色主题 */
+.job-grid .card[data-tone="blue"] {
+    background: var(--c-blue);
+    color: var(--c-white);
+    --card-fig-color: var(--c-white);
+    --card-plat-bg: var(--c-black);
+    --card-plat-fg: var(--c-yellow);
+    --card-tag-bg: rgba(255, 255, 255, 0.14);
+    --card-tag-fg: var(--c-white);
 }
 
-/* SVG 图形填充色适配各卡片背景（对齐设计稿 L47-L50） */
-/* 红色/白色背景卡片 → 白色 SVG */
-.job-grid .card:nth-child(8n+1) .card__fig svg *,
-.job-grid .card:nth-child(8n+6) .card__fig svg * { fill: #fff; stroke: #fff; }
-/* 黑色背景卡片 → 黄色 SVG */
-.job-grid .card:nth-child(8n+3) .card__fig svg *,
-.job-grid .card:nth-child(8n+7) .card__fig svg * { fill: var(--c-yellow); stroke: var(--c-yellow); }
-/* 黄色背景卡片 → 黑色 SVG */
-.job-grid .card:nth-child(8n+4) .card__fig svg * { fill: var(--c-black); stroke: var(--c-black); }
-/* 米白背景卡片 → 红色 SVG */
-.job-grid .card:nth-child(8n+2) .card__fig svg *,
-.job-grid .card:nth-child(8n+5) .card__fig svg *,
-.job-grid .card:nth-child(8n+8) .card__fig svg * { fill: var(--c-red); stroke: var(--c-red); }
-
-/* nth-child 色彩适配：标题、元信息、薪资 */
-.job-grid .card:nth-child(8n+1) .card__title,
-.job-grid .card:nth-child(8n+6) .card__title { color: var(--c-white); }
-
-.job-grid .card:nth-child(8n+3) .card__title,
-.job-grid .card:nth-child(8n+7) .card__title { color: var(--c-paper); }
-
-.job-grid .card:nth-child(8n+1) .card__meta,
-.job-grid .card:nth-child(8n+1) .card__meta span,
-.job-grid .card:nth-child(8n+6) .card__meta,
-.job-grid .card:nth-child(8n+6) .card__meta span { color: var(--c-white); }
-
-.job-grid .card:nth-child(8n+3) .card__meta,
-.job-grid .card:nth-child(8n+3) .card__meta span,
-.job-grid .card:nth-child(8n+7) .card__meta,
-.job-grid .card:nth-child(8n+7) .card__meta span {
-    color: rgba(244, 240, 234, 0.92);
-    opacity: 1;
+/* 黑色主题 */
+.job-grid .card[data-tone="black"] {
+    background: var(--c-black);
+    color: var(--c-paper);
+    --card-fig-color: var(--c-yellow);
+    --card-plat-bg: rgba(255, 255, 255, 0.2);
+    --card-plat-fg: var(--c-white);
+    --card-tag-bg: rgba(255, 255, 255, 0.12);
+    --card-tag-fg: var(--c-yellow);
 }
 
-.job-grid .card:nth-child(8n+1) .card__sal,
-.job-grid .card:nth-child(8n+6) .card__sal { color: var(--c-white); }
+/* 米白主题 */
+.job-grid .card[data-tone="paper"] {
+    background: var(--c-paper);
+    color: var(--c-black);
+    --card-fig-color: var(--c-red);
+    --card-plat-bg: var(--c-black);
+    --card-plat-fg: var(--c-paper);
+    --card-tag-bg: rgba(26, 26, 26, 0.10);
+    --card-tag-fg: var(--c-white);
+}
 
-.job-grid .card:nth-child(8n+3) .card__sal,
-.job-grid .card:nth-child(8n+7) .card__sal { color: var(--c-paper); }
+/* === 平台标签 / 卡片标签用 CSS 变量 === */
+.card__plat {
+    background: var(--card-plat-bg, var(--c-black));
+    color: var(--card-plat-fg, var(--c-paper));
+}
 
-/* nth-child 色彩适配：平台标签（对齐设计稿 L61-L64） */
-/* 米白背景卡片 → 黑色底米白字 */
-.job-grid .card:nth-child(8n+2) .card__plat,
-.job-grid .card:nth-child(8n+5) .card__plat,
-.job-grid .card:nth-child(8n+8) .card__plat { background: var(--c-black); color: var(--c-paper); }
-/* 红色/黑色背景卡片 → 半透明白色底 */
-.job-grid .card:nth-child(8n+1) .card__plat,
-.job-grid .card:nth-child(8n+3) .card__plat,
-.job-grid .card:nth-child(8n+7) .card__plat { background: rgba(255, 255, 255, 0.2); color: var(--c-white); }
-/* 红色背景(8n+6) → 黑色底黄色字 */
-.job-grid .card:nth-child(8n+6) .card__plat { background: var(--c-black); color: var(--c-yellow); }
-/* 黄色背景卡片 → 黑色底黄色字 */
-.job-grid .card:nth-child(8n+4) .card__plat { background: var(--c-black); color: var(--c-yellow); }
+.card__tag {
+    background: var(--card-tag-bg, rgba(26, 26, 26, 0.08));
+    color: var(--card-tag-fg, var(--c-black));
+}
 
-/* nth-child 色彩适配：标签（对齐设计稿 L65-L67） */
-/* 红色背景卡片 → 半透明白色底 */
-.job-grid .card:nth-child(8n+1) .card__tag,
-.job-grid .card:nth-child(8n+6) .card__tag { background: rgba(255, 255, 255, 0.15); color: var(--c-white); }
-/* 黑色背景卡片 → 半透明黄色底 */
-.job-grid .card:nth-child(8n+3) .card__tag,
-.job-grid .card:nth-child(8n+7) .card__tag { background: rgba(255, 199, 44, 0.2); color: var(--c-yellow); }
-/* 黄色背景卡片 → 半透明黑色底 */
-.job-grid .card:nth-child(8n+4) .card__tag { background: rgba(26, 26, 26, 0.12); color: var(--c-black); }
-
-/* SVG 图形容器 */
+/* SVG 图形容器 + currentColor 自动适配 */
 .card__fig {
     position: absolute;
     bottom: 0;
@@ -388,12 +358,18 @@ h1, h2, h3, h4, h5, h6 {
     opacity: 0.10;
     z-index: 2;
     pointer-events: none;
+    color: var(--card-fig-color, var(--c-red));
 }
 
 .card__fig svg {
     width: 100%;
     height: 100%;
     display: block;
+}
+
+.card__fig svg * {
+    fill: currentColor;
+    stroke: currentColor;
 }
 
 /* 卡片编号（右上角装饰） */
@@ -449,6 +425,11 @@ h1, h2, h3, h4, h5, h6 {
     flex: 1;
     text-transform: uppercase;
     letter-spacing: 0.5px;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-all;
 }
 
 .card__plat {
@@ -458,7 +439,7 @@ h1, h2, h3, h4, h5, h6 {
     font-weight: 800;
     text-transform: uppercase;
     letter-spacing: 1px;
-    color: var(--c-white);
+    color: var(--card-plat-fg, var(--c-paper));
     flex-shrink: 0;
     line-height: 1.4;
 }
@@ -489,12 +470,12 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 .card__tag {
-    background: var(--c-black);
+    background: var(--card-tag-bg, var(--c-black));
     padding: 2px 7px;
     border-radius: 0;
     font-size: 10px;
     font-weight: 700;
-    color: var(--c-white);
+    color: var(--card-tag-fg, var(--c-white));
     text-transform: uppercase;
     letter-spacing: 0.3px;
     line-height: 1.4;
@@ -1123,6 +1104,262 @@ a {
    简历结构化内容（工作台右侧）
    ======================================== */
 
+.resume-sheet {
+    width: 100%;
+    background: #fffdf9;
+    color: #1a1a1a;
+    border: 3px solid #1a1a1a;
+    box-shadow: 12px 12px 0 rgba(0, 0, 0, 0.12);
+    overflow: hidden;
+}
+
+.resume-preview-shell {
+    position: relative;
+}
+
+.resume-preview-stage {
+    position: relative;
+    z-index: 1;
+}
+
+.resume-preview-guides {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 2;
+}
+
+.resume-page-guide {
+    position: absolute;
+    left: 0;
+    right: 0;
+    border-top: 2px dashed rgba(230, 43, 30, 0.42);
+}
+
+.resume-page-guide span {
+    position: absolute;
+    right: 0;
+    top: -12px;
+    padding: 2px 8px;
+    background: rgba(230, 43, 30, 0.92);
+    color: var(--c-white);
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.4px;
+}
+
+.resume-source-buffer {
+    display: none;
+}
+
+.resume-preview-shell[data-editable="true"] .resume-sheet {
+    cursor: text;
+}
+
+.resume-preview-shell[data-editable="true"] .resume-sheet:focus {
+    outline: 3px solid rgba(255, 199, 44, 0.86);
+    outline-offset: 4px;
+}
+
+/* timeline 模板：深色整体背景 */
+.resume-sheet.resume-sheet--timeline {
+    background: #1e1e1e;
+    color: #e0e0e0;
+    border-color: #333;
+    box-shadow: 8px 8px 0 rgba(0, 0, 0, 0.3) !important;
+}
+
+.resume-sheet--structured .resume-sheet__header {
+    padding: 28px 30px 20px;
+    border-bottom: 4px solid var(--c-red);
+    background:
+        linear-gradient(135deg, rgba(230, 43, 30, 0.08), transparent 42%),
+        linear-gradient(0deg, #fffdf9, #fffdf9);
+}
+
+.resume-sheet--timeline .resume-sheet__header {
+    padding: 28px 30px 22px;
+    background: #1a1a1a;
+    color: #f7f3ec;
+    border-bottom: 6px solid var(--c-yellow);
+}
+
+.resume-sheet__name {
+    font-family: 'Courier New', monospace;
+    font-size: 28px;
+    line-height: 1.15;
+    font-weight: 900;
+    letter-spacing: 1px;
+}
+
+.resume-sheet__headline {
+    margin-top: 8px;
+    font-size: 14px;
+    font-weight: 800;
+    color: var(--c-red);
+}
+
+.resume-sheet--timeline .resume-sheet__headline {
+    color: var(--c-yellow);
+}
+
+.resume-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 14px;
+}
+
+.resume-meta__item {
+    display: inline-flex;
+    align-items: center;
+    min-height: 28px;
+    padding: 4px 10px;
+    border: 2px solid #1a1a1a;
+    background: rgba(255, 255, 255, 0.92);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.4;
+}
+
+.resume-sheet--timeline .resume-meta__item {
+    border-color: var(--c-yellow);
+    background: rgba(255, 199, 44, 0.1);
+    color: #f7f3ec;
+}
+
+.resume-summary {
+    margin-top: 14px;
+    font-size: 13px;
+    line-height: 1.8;
+    color: #5d5d5d;
+}
+
+.resume-sheet--timeline .resume-summary {
+    color: rgba(244, 240, 234, 0.82);
+}
+
+.resume-sheet__body {
+    padding: 22px 28px 28px;
+    display: grid;
+    gap: 14px;
+}
+
+.resume-sheet--timeline .resume-sheet__body {
+    background:
+        linear-gradient(90deg, rgba(255, 199, 44, 0.12) 0, rgba(255, 199, 44, 0.12) 4px, transparent 4px, transparent 100%),
+        #1e1e1e;
+}
+
+.resume-section {
+    border: 2px solid #1a1a1a;
+    padding: 16px 18px;
+    background: #ffffff;
+}
+
+.resume-sheet--timeline .resume-section {
+    margin-left: 14px;
+    background: #2a2a2a;
+    border-color: #444;
+    box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.2) !important;
+}
+
+.resume-sheet--timeline .resume-section__title {
+    color: var(--c-yellow);
+    border-bottom-color: var(--c-yellow);
+}
+
+.resume-sheet--timeline .resume-list li {
+    color: #ccc;
+}
+
+.resume-sheet--timeline .resume-list li::before {
+    background: var(--c-yellow);
+}
+
+.resume-sheet--timeline .resume-block__content {
+    color: #ccc;
+}
+
+.resume-sheet--timeline .resume-block__marker {
+    border-color: #666;
+    box-shadow: 0 0 0 2px rgba(255, 199, 44, 0.2);
+}
+
+.resume-sheet--timeline .resume-block.is-period .resume-block__marker {
+    border-color: var(--c-red);
+    box-shadow: 0 0 0 2px rgba(230, 43, 30, 0.3);
+}
+
+.resume-section__title {
+    display: inline-block;
+    margin-bottom: 12px;
+    padding-bottom: 4px;
+    border-bottom: 4px solid var(--c-red);
+    font-size: 13px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.resume-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: grid;
+    gap: 8px;
+}
+
+.resume-list li {
+    position: relative;
+    padding-left: 14px;
+    font-size: 13px;
+    line-height: 1.8;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.resume-list li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 11px;
+    width: 7px;
+    height: 3px;
+    background: var(--c-red);
+}
+
+.resume-block {
+    position: relative;
+    padding-left: 22px;
+    margin-bottom: 10px;
+}
+
+.resume-block:last-child {
+    margin-bottom: 0;
+}
+
+.resume-block__marker {
+    position: absolute;
+    left: 0;
+    top: 8px;
+    width: 10px;
+    height: 10px;
+    border: 2px solid #1a1a1a;
+    background: var(--c-yellow);
+}
+
+.resume-block.is-period .resume-block__marker {
+    background: var(--c-red);
+}
+
+.resume-block__content {
+    font-size: 13px;
+    line-height: 1.8;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 .rsec {
     margin-bottom: 18px;
     padding-bottom: 14px;
@@ -1211,6 +1448,35 @@ a {
     margin-bottom: 16px;
     align-items: center;
     flex-wrap: wrap;
+}
+
+.resume-template-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: auto;
+    color: var(--c-yellow);
+    font-size: 10px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.resume-template-switch__select {
+    min-width: 108px;
+    height: 34px;
+    padding: 0 10px;
+    border: 2px solid var(--c-yellow);
+    background: #1f1f1f;
+    color: var(--c-paper);
+    font-size: 11px;
+    font-weight: 700;
+    font-family: inherit;
+}
+
+.resume-template-switch__select:focus {
+    outline: none;
+    border-color: var(--c-red);
 }
 
 .res-btn {

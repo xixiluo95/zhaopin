@@ -35,6 +35,8 @@ let homeJobsSignature = '';
 let homeHasRendered = false;
 const LIVE_BATCH_GROUP_SIZE = 20;
 let liveBatchSyncState = createEmptyLiveBatchSyncState();
+const DASHBOARD_CLIENT_ID = `dashboard-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+let dashboardSessionOpened = false;
 
 /* ==================== 批次视图状态 ==================== */
 
@@ -203,7 +205,14 @@ async function loadJobs(options = {}) {
   const container = document.getElementById('view-home');
   if (!container) return;
 
-  if (!silent || !homeHasRendered) {
+  const hasReusableBatchCache = (
+    isBatchView &&
+    currentBatchId &&
+    liveBatchSyncState.batchId === currentBatchId &&
+    liveBatchSyncState.renderedGroups > 0
+  );
+
+  if ((!silent || !homeHasRendered) && !hasReusableBatchCache) {
     container.innerHTML = '<div class="loading">加载中...</div>';
   }
 
@@ -252,11 +261,49 @@ async function loadJobs(options = {}) {
     homeJobsSignature = nextSignature;
     homeHasRendered = true;
     initCardObserver();
+    initGridResizeObserver();
   } catch (err) {
     if (!silent || !homeHasRendered) {
       const isBackendError = err.message.includes('后端未启动') || err.message.includes('Failed to fetch');
       if (isBackendError) {
-        container.innerHTML = renderBackendError(err.message);
+        const errorType = err.errorType || 'CONTROLLER_UNREACHABLE';
+        container.innerHTML = renderBackendError(err.message, errorType, err.extensionId);
+
+        // CONTROLLER_STARTING 是临时态，自动重试（最多10次，约20秒）
+        if (errorType === 'CONTROLLER_STARTING') {
+          const retryCount = (container.dataset.startingRetries || 0) + 1;
+          if (retryCount <= 10) {
+            container.dataset.startingRetries = retryCount;
+            setTimeout(() => loadJobs({ silent: true, forceRender: true }), 2000);
+          } else {
+            delete container.dataset.startingRetries;
+            container.innerHTML = renderBackendError(
+              'Controller 启动超时，请手动检查',
+              'CONTROLLER_UNREACHABLE',
+              err.extensionId
+            );
+          }
+        } else if (errorType !== 'NATIVE_HOST_NOT_INSTALLED') {
+          const wakeBtn = document.getElementById('btn-wake-controller');
+          if (wakeBtn) {
+            wakeBtn.addEventListener('click', async () => {
+              try {
+                const response = await chrome.runtime.sendMessage({
+                  type: 'WAKE_UP_CONTROLLER',
+                  reason: 'dashboard_backend_error'
+                });
+                if (response && response.success) {
+                  showToast('Controller 唤醒成功，正在重试', 'success');
+                  await loadJobs({ silent: false, forceRender: true });
+                } else {
+                  showToast(`自动唤醒失败: ${response?.error || '未知错误'}`, 'error');
+                }
+              } catch (wakeError) {
+                showToast(`自动唤醒失败: ${wakeError.message}`, 'error');
+              }
+            }, { once: true });
+          }
+        }
       } else {
         container.innerHTML = '<div class="empty-state"></div>';
         showToast(err.message, 'error');
@@ -266,11 +313,39 @@ async function loadJobs(options = {}) {
 }
 
 /** 渲染后端不可达时的引导页 */
-function renderBackendError(errMsg) {
+function renderBackendError(errMsg, errorType, extensionId) {
+  if (errorType === 'NATIVE_HOST_NOT_INSTALLED') {
+    const installCmd = extensionId
+      ? `bash controller/install_host.sh ${extensionId}`
+      : 'bash controller/install_host.sh &lt;extension-id&gt;';
+    return `<div class="empty-state empty-state--backend">
+      <h3 style="color:var(--c-yellow)">自动唤醒组件未安装</h3>
+      <p>浏览器无法通过 Native Messaging 自动拉起本地 Controller。</p>
+      <p>请在终端执行以下命令完成注册：</p>
+      <p><code>${escapeHtml(installCmd)}</code></p>
+      <p style="color:var(--c-gray);font-size:12px;margin-top:8px">${escapeHtml(errMsg || '')}</p>
+      <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:16px">
+        <button class="res-btn res-btn--clear" onclick="location.reload()">安装后刷新页面</button>
+      </div>
+    </div>`;
+  }
+
+  if (errorType === 'CONTROLLER_STARTING') {
+    return `<div class="empty-state empty-state--backend">
+      <h3 style="color:var(--c-blue)">Controller 正在启动中...</h3>
+      <p>自动唤醒已触发，等待服务就绪</p>
+      <div style="margin-top:12px"><span class="spinner"></span></div>
+    </div>`;
+  }
+
   return `<div class="empty-state empty-state--backend">
-    <h3>后端未启动或连接失败</h3>
+    <h3>Controller 服务未运行</h3>
     <p>请先在终端运行 <code>npm run start</code> 启动 Controller</p>
-    <button class="res-btn res-btn--g" onclick="location.reload()">刷新页面重试</button>
+    <p style="color:var(--c-gray);font-size:12px;margin-top:8px">${escapeHtml(errMsg || '')}</p>
+    <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:16px">
+      <button class="res-btn res-btn--g" id="btn-wake-controller">尝试自动唤醒</button>
+      <button class="res-btn res-btn--clear" onclick="location.reload()">刷新页面重试</button>
+    </div>
   </div>`;
 }
 
@@ -423,9 +498,7 @@ async function syncCurrentBatchJobs(batchId, options = {}) {
   });
   const total = Number(firstPage.total) || 0;
   const expectedGroups = Math.ceil(total / LIVE_BATCH_GROUP_SIZE);
-  const targetGroups = flushAll
-    ? expectedGroups
-    : Math.min(expectedGroups, Math.max(1, liveBatchSyncState.renderedGroups + 1));
+  const targetGroups = expectedGroups;
 
   const nextPages = new Map();
   if (targetGroups >= 1) {
@@ -491,9 +564,407 @@ async function fetchAllJobPages(params = {}) {
   };
 }
 
+/* ==================== 蒙德里安布局引擎 ==================== */
+
+const MONDRIAN_TONES = ['red', 'yellow', 'blue', 'black', 'paper'];
+const MONDRIAN_SIZES = ['S', 'W', 'T']; // S=1x1, W=2x1, T=1x2
+
+/**
+ * 计算列数：根据容器宽度确定网格列数
+ * @param {number} containerWidth - 容器像素宽度
+ * @returns {number} 列数 (1/2/4)
+ */
+function calcGridColumns(containerWidth) {
+  if (containerWidth <= 600) return 1;
+  if (containerWidth <= 1000) return 2;
+  return 4;
+}
+
+function stableHash(input) {
+  const text = String(input || '');
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function getStableToneOrder(job, index = 0) {
+  const seed = `${job?.title || ''}|${job?.company || ''}|${job?.location || ''}|${index}`;
+  const offset = stableHash(`tone:${seed}`) % MONDRIAN_TONES.length;
+  return MONDRIAN_TONES.map((_, i) => MONDRIAN_TONES[(offset + i) % MONDRIAN_TONES.length]);
+}
+
+/**
+ * 蒙德里安布局引擎
+ * 为每张岗位卡片计算显式网格位置、规格和颜色
+ * @param {Array} jobs - 岗位数组
+ * @param {number} columns - 当前列数 (1/2/4)
+ * @returns {Array} 布局结果数组
+ */
+function buildMondrianLayout(jobs, columns) {
+  const n = jobs.length;
+
+  // 短路：空或极少卡片
+  if (n === 0) return [];
+  if (n <= 3 || columns === 1) {
+    // 少量卡片也需要邻接不同色
+    const toneMatrix1 = [];
+    const safeCols = Math.max(1, columns);
+    for (let r = 0; r < Math.ceil(n / safeCols) + 1; r++) {
+      toneMatrix1.push(new Array(safeCols).fill(null));
+    }
+    const res = [];
+    for (let i = 0; i < n; i++) {
+      const rs = Math.floor(i / safeCols) + 1;
+      const cs = (i % safeCols) + 1;
+      const tone = pickToneFromMatrix(jobs[i], i, toneMatrix1, rs, cs, 1, 1, safeCols, toneMatrix1.length);
+      toneMatrix1[rs - 1][cs - 1] = tone;
+      res.push({
+        id: jobs[i].id,
+        rowStart: rs,
+        colStart: cs,
+        rowSpan: 1,
+        colSpan: 1,
+        size: 'S',
+        tone,
+        figureVariant: stableHash(jobs[i].title || jobs[i].company || `${i}`) % 12
+      });
+    }
+    return res;
+  }
+
+  // 生成规格池
+  const specPool = buildSpecPool(jobs, columns);
+
+  // 初始化二维占位矩阵（存 job 索引）和颜色矩阵（存 tone 字符串）
+  const maxRows = Math.ceil((n + specPool.filter(s => s !== 'S').length) / columns) + 4;
+  const matrix = [];
+  const toneMatrix = [];
+  for (let r = 0; r < maxRows; r++) {
+    matrix.push(new Array(columns).fill(null));
+    toneMatrix.push(new Array(columns).fill(null));
+  }
+
+  // 已放置强调卡的空间记录
+  const placedEmphatics = [];
+
+  const results = [];
+  let specIndex = 0;
+
+  for (let i = 0; i < n; i++) {
+    const job = jobs[i];
+    const targetSize = specPool[specIndex++] || 'S';
+
+    // 扫描第一个可用空位
+    const pos = findFirstEmpty(matrix, columns, maxRows);
+    if (!pos) break;
+
+    // 尝试放置
+    const placed = tryPlace(matrix, pos.row, pos.col, targetSize, columns, maxRows, placedEmphatics);
+
+    // 写入占位矩阵
+    for (let r = placed.rowStart - 1; r < placed.rowStart - 1 + placed.rowSpan; r++) {
+      for (let c = placed.colStart - 1; c < placed.colStart - 1 + placed.colSpan; c++) {
+        if (r < maxRows && c < columns) {
+          matrix[r][c] = i;
+        }
+      }
+    }
+
+    // 记录强调卡位置
+    if (placed.size !== 'S') {
+      placedEmphatics.push({ row: placed.rowStart, col: placed.colStart, size: placed.size });
+    }
+
+    // 从 toneMatrix 选择颜色
+    const tone = pickToneFromMatrix(job, i, toneMatrix, placed.rowStart, placed.colStart, placed.rowSpan, placed.colSpan, columns, maxRows);
+
+    // 写入颜色矩阵
+    for (let r = placed.rowStart - 1; r < placed.rowStart - 1 + placed.rowSpan; r++) {
+      for (let c = placed.colStart - 1; c < placed.colStart - 1 + placed.colSpan; c++) {
+        if (r < maxRows && c < columns) {
+          toneMatrix[r][c] = tone;
+        }
+      }
+    }
+
+    results.push({
+      id: job.id,
+      rowStart: placed.rowStart,
+      colStart: placed.colStart,
+      rowSpan: placed.rowSpan,
+      colSpan: placed.colSpan,
+      size: placed.size,
+      tone,
+      figureVariant: stableHash(job.title || job.company || `${i}`) % 12
+    });
+  }
+
+  return results;
+}
+
+/**
+ * 生成规格池：按比例分配 S/W/T
+ */
+function buildSpecPool(jobs, columns) {
+  const total = jobs.length;
+  const pool = new Array(total).fill('S');
+  if (total <= 3 || columns === 1) return pool;
+
+  const emphaticTarget = Math.max(1, Math.round(total * 0.2));
+  const wideQuota = columns >= 4 ? Math.floor(emphaticTarget / 2) : 0;
+  const tallQuota = emphaticTarget - wideQuota;
+
+  // 基于岗位名称做稳定伪随机，避免尺寸分布出现机械周期。
+  const ranked = jobs.map((job, index) => {
+    const identity = `${job.title || ''}|${job.company || ''}|${job.location || ''}`;
+    return {
+      index,
+      wideScore: stableHash(`wide:${identity}`),
+      tallScore: stableHash(`tall:${identity}`)
+    };
+  });
+
+  if (wideQuota > 0) {
+    const widePicked = [...ranked]
+      .sort((a, b) => a.wideScore - b.wideScore)
+      .slice(0, wideQuota);
+    for (const item of widePicked) pool[item.index] = 'W';
+  }
+
+  if (tallQuota > 0) {
+    const tallPicked = ranked
+      .filter(item => pool[item.index] === 'S')
+      .sort((a, b) => a.tallScore - b.tallScore)
+      .slice(0, tallQuota);
+    for (const item of tallPicked) pool[item.index] = 'T';
+  }
+
+  return pool;
+}
+
+/**
+ * 从左上到右下找第一个空位
+ */
+function findFirstEmpty(matrix, columns, maxRows) {
+  for (let r = 0; r < maxRows; r++) {
+    for (let c = 0; c < columns; c++) {
+      if (matrix[r][c] === null) {
+        return { row: r, col: c };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * 尝试在指定位置放置指定规格的卡片
+ * 不满足约束时逐步降级
+ */
+function tryPlace(matrix, row, col, targetSize, columns, maxRows, placedEmphatics) {
+  // 按优先级尝试：目标规格 -> 降级
+  const candidates = [targetSize];
+  if (targetSize !== 'S') {
+    candidates.push('S');
+  }
+
+  for (const size of candidates) {
+    const span = getSizeSpan(size);
+    if (canFit(matrix, row, col, span.rowSpan, span.colSpan, columns, maxRows)) {
+      if (size !== 'S' && !checkSpatialConstraints(row, col, size, placedEmphatics, columns)) {
+        continue; // 空间约束不满足，尝试下一个
+      }
+      return {
+        rowStart: row + 1,
+        colStart: col + 1,
+        rowSpan: span.rowSpan,
+        colSpan: span.colSpan,
+        size
+      };
+    }
+  }
+
+  // 兜底：强制 1x1
+  return {
+    rowStart: row + 1,
+    colStart: col + 1,
+    rowSpan: 1,
+    colSpan: 1,
+    size: 'S'
+  };
+}
+
+/**
+ * 获取规格对应的行列跨度
+ */
+function getSizeSpan(size) {
+  switch (size) {
+    case 'W': return { rowSpan: 1, colSpan: 2 };
+    case 'T': return { rowSpan: 2, colSpan: 1 };
+    default: return { rowSpan: 1, colSpan: 1 };
+  }
+}
+
+/**
+ * 检查指定区域是否全部为空
+ */
+function canFit(matrix, row, col, rowSpan, colSpan, columns, maxRows) {
+  if (col + colSpan > columns) return false;
+  if (row + rowSpan > maxRows) return false;
+  for (let r = row; r < row + rowSpan; r++) {
+    for (let c = col; c < col + colSpan; c++) {
+      if (matrix[r][c] !== null) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * 检查强调卡空间约束
+ * 1) 同行禁止两个强调卡
+ * 2) 同列内 T 间隔至少 1 格
+ * 3) 其余强调卡曼哈顿距离 >= 2
+ */
+function checkSpatialConstraints(row, col, size, placedEmphatics, columns) {
+  for (const p of placedEmphatics) {
+    // placedEmphatics 存的是 1-indexed (rowStart/colStart), row/col 是 0-indexed
+    const pr = p.row - 1;
+    const pc = p.col - 1;
+    const manhattan = Math.abs(pr - row) + Math.abs(pc - col);
+
+    // 规则1: 同行不允许两个强调卡
+    if (pr === row && pc !== col) return false;
+
+    // 规则2: 同列T间隔至少1格
+    if (pc === col && size === 'T' && p.size === 'T' && Math.abs(pr - row) < 2) return false;
+
+    // 规则3: 曼哈顿距离 >= 2
+    if (manhattan < 2) return false;
+  }
+  return true;
+}
+
+/**
+ * 选择颜色：基于 toneMatrix 的两阶段策略
+ * 阶段1: 严格过滤——排除与邻居同色的候选
+ * 阶段2: 最少违规回退——选冲突最少的颜色
+ */
+function pickToneFromMatrix(job, index, toneMatrix, rowStart, colStart, rowSpan, colSpan, columns, maxRows) {
+  const neighborTones = getNeighborTonesFromMatrix(toneMatrix, rowStart, colStart, rowSpan, colSpan, columns, maxRows);
+  const preferredOrder = getStableToneOrder(job, index);
+
+  // 阶段1: 严格过滤
+  const legal = preferredOrder.filter(t => !neighborTones.has(t));
+  if (legal.length > 0) {
+    return legal[0];
+  }
+
+  // 阶段2: 最少违规回退
+  let bestTone = preferredOrder[0];
+  let minConflicts = Infinity;
+  for (const tone of preferredOrder) {
+    const conflicts = [...neighborTones].filter(t => t === tone).length;
+    if (conflicts < minConflicts) {
+      minConflicts = conflicts;
+      bestTone = tone;
+    }
+  }
+  return bestTone;
+}
+
+/**
+ * 从 toneMatrix 获取邻居颜色集合
+ */
+function getNeighborTonesFromMatrix(toneMatrix, rowStart, colStart, rowSpan, colSpan, columns, maxRows) {
+  const tones = new Set();
+
+  // 上方
+  if (rowStart > 1) {
+    for (let c = colStart - 1; c < colStart - 1 + colSpan; c++) {
+      if (c < columns && toneMatrix[rowStart - 2] && toneMatrix[rowStart - 2][c]) {
+        tones.add(toneMatrix[rowStart - 2][c]);
+      }
+    }
+  }
+  // 下方
+  if (rowStart - 1 + rowSpan < maxRows) {
+    const bRow = rowStart - 1 + rowSpan;
+    for (let c = colStart - 1; c < colStart - 1 + colSpan; c++) {
+      if (c < columns && toneMatrix[bRow] && toneMatrix[bRow][c]) {
+        tones.add(toneMatrix[bRow][c]);
+      }
+    }
+  }
+  // 左方
+  if (colStart > 1) {
+    const lCol = colStart - 2;
+    for (let r = rowStart - 1; r < rowStart - 1 + rowSpan; r++) {
+      if (r < maxRows && toneMatrix[r] && toneMatrix[r][lCol]) {
+        tones.add(toneMatrix[r][lCol]);
+      }
+    }
+  }
+  // 右方
+  if (colStart - 1 + colSpan < columns) {
+    const rCol = colStart - 1 + colSpan;
+    for (let r = rowStart - 1; r < rowStart - 1 + rowSpan; r++) {
+      if (r < maxRows && toneMatrix[r] && toneMatrix[r][rCol]) {
+        tones.add(toneMatrix[r][rCol]);
+      }
+    }
+  }
+
+  return tones;
+}
+
+/* ==================== 渲染函数（改造后） ==================== */
+
+// 当前布局列数
+let currentGridColumns = 4;
+
+// ResizeObserver 响应式列数管理（带防抖）
+let gridResizeObserver = null;
+let gridResizeTimer = null;
+const GRID_RESIZE_DEBOUNCE = 150;
+
+function initGridResizeObserver() {
+  if (gridResizeObserver) gridResizeObserver.disconnect();
+
+  gridResizeObserver = new ResizeObserver(entries => {
+    for (const entry of entries) {
+      const width = entry.contentRect.width;
+      const newCols = calcGridColumns(width);
+
+      if (newCols !== currentGridColumns) {
+        currentGridColumns = newCols;
+        clearTimeout(gridResizeTimer);
+        gridResizeTimer = setTimeout(() => {
+          // 重新渲染当前视图
+          const container = document.getElementById('view-home');
+          if (container && homeHasRendered) {
+            // 触发非静默加载以重新布局
+            loadJobs({ silent: true, forceRender: true });
+          }
+        }, GRID_RESIZE_DEBOUNCE);
+      }
+    }
+  });
+
+  // 监听外层持久容器，避免因 innerHTML 重建导致 Observer 频繁断开
+  const viewHome = document.getElementById('view-home');
+  if (viewHome) {
+    gridResizeObserver.observe(viewHome);
+  }
+}
+
 function renderJobGrid(jobs) {
-  return `<div class="job-grid">${jobs.map((job, i) => {
-    return renderJobCard(job, i);
+  // 计算布局
+  const layouts = buildMondrianLayout(jobs, currentGridColumns);
+
+  return `<div class="job-grid" style="grid-template-columns:repeat(${currentGridColumns},1fr)">${layouts.map((layout, i) => {
+    return renderJobCard(jobs[i], i, layout);
   }).join('')}</div>`;
 }
 
@@ -505,7 +976,7 @@ function renderSourceLink(url, inlineStyle = '') {
   return `<a class="bep bep--s" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener"${inlineStyle ? ` style="${inlineStyle}"` : ''}>查看原链接</a>`;
 }
 
-function renderJobCard(job, index = 0) {
+function renderJobCard(job, index = 0, layout = null) {
   const platform = escapeHtml(job.platform || 'unknown');
   const title = escapeHtml(job.title || '');
   const company = escapeHtml(job.company || '');
@@ -530,16 +1001,21 @@ function renderJobCard(job, index = 0) {
   if (education) tags.push(education);
   if (keywords) tags.push(...keywords.split(/[,，]/).filter(k => k.trim()).slice(0, 2));
 
-  // 卡片编号（两位数）
+  // 卡片编号
   const num = String(index + 1).padStart(2, '0');
 
-  // SVG 图形（12 个循环）
-  const svgIndex = index % 12;
-  const svg = SUPREMATISM_SVG[svgIndex];
+  // SVG 图形
+  const figureVariant = layout ? layout.figureVariant : (index % 12);
+  const svg = SUPREMATISM_SVG[figureVariant];
 
-  // 跨行/跨列由 CSS nth-child 接管，不再需要 spanClass 逻辑
+  // 布局属性
+  const sizeAttr = layout ? `data-size="${layout.size}"` : '';
+  const toneAttr = layout ? `data-tone="${layout.tone}"` : '';
+  const gridStyle = layout
+    ? `style="grid-column:${layout.colStart}/span ${layout.colSpan};grid-row:${layout.rowStart}/span ${layout.rowSpan}"`
+    : '';
 
-  return `<div class="card anim" data-id="${job.id}">
+  return `<div class="card anim" data-id="${job.id}" ${sizeAttr} ${toneAttr} ${gridStyle}>
     <div class="card__num">${num}</div>
     <div class="card__head">
       <div class="card__title">${title}</div>
@@ -699,6 +1175,268 @@ let resumeViewInitialized = false;
 let currentResume = null;          // 当前简历数据对象
 let currentResumeMode = 'view';    // 'view' | 'edit'
 let aiConfigured = false;          // AI 是否已配置
+const RESUME_TEMPLATE_STORAGE_KEY = 'jobhunter_resume_template';
+const RESUME_TEMPLATE_OPTIONS = [
+  { id: 'structured', label: '结构版' },
+  { id: 'timeline', label: '时间版' },
+];
+let currentResumeTemplate = readStoredResumeTemplate();
+
+function readStoredResumeTemplate() {
+  try {
+    const saved = localStorage.getItem(RESUME_TEMPLATE_STORAGE_KEY);
+    return RESUME_TEMPLATE_OPTIONS.some(option => option.id === saved) ? saved : 'structured';
+  } catch (_) {
+    return 'structured';
+  }
+}
+
+function persistResumeTemplate(templateId) {
+  currentResumeTemplate = RESUME_TEMPLATE_OPTIONS.some(option => option.id === templateId)
+    ? templateId
+    : 'structured';
+  try {
+    localStorage.setItem(RESUME_TEMPLATE_STORAGE_KEY, currentResumeTemplate);
+  } catch (_) {
+    // ignore storage failures
+  }
+}
+
+function renderResumeTemplateSelector(viewMode = 'default') {
+  const idPrefix = viewMode === 'default' ? 'def' : 'exp';
+  const options = RESUME_TEMPLATE_OPTIONS.map((option) => `
+    <option value="${option.id}" ${option.id === currentResumeTemplate ? 'selected' : ''}>
+      ${option.label}
+    </option>
+  `).join('');
+
+  return `
+    <label class="resume-template-switch" for="${idPrefix}-resume-template">
+      <span>模板</span>
+      <select class="resume-template-switch__select" id="${idPrefix}-resume-template" data-view="${viewMode}">
+        ${options}
+      </select>
+    </label>
+  `;
+}
+
+function escapeResumeAttr(value) {
+  return escapeHtml(String(value == null ? '' : value)).replace(/"/g, '&quot;');
+}
+
+function normalizeResumeSource(markdown) {
+  let text = String(markdown || '').replace(/\r/g, '\n');
+  text = text.replace(/(^|\n)\s*[\u25a1\uF0B7\u2022\u25CF\u25E6\u00B7▪■◆★☆►▶]+\s*/g, '$1- ');
+  text = text.replace(/[ \t]+/g, ' ');
+  text = text.replace(/\n{3,}/g, '\n\n');
+  text = text.replace(/\s*(个人信息|个人概况|求职意向|教育背景|工作经历|实习经历|项目经历|校园经历|技能特长|专业技能|核心技能|自我评价|荣誉奖项|获奖经历|证书|语言能力)\s*/g, '\n$1\n');
+  text = text.replace(/\s*(姓名[:：]|性别[:：]|出生年月[:：]|电话[:：]|联系电话[:：]|手机[:：]|邮箱[:：]|电子邮件[:：]|微信[:：]|现居地[:：]|所在地[:：]|毕业院校[:：]|学校[:：]|学历[:：]|专业[:：])\s*/g, '\n$1');
+  text = text.replace(/((?:19|20)\d{2}[./年-]?\d{0,2}(?:月)?\s*(?:[-~—至到]\s*(?:至今|现在|(?:19|20)\d{2}[./年-]?\d{0,2}(?:月)?)))/g, '\n$1');
+  text = text.replace(/\n{3,}/g, '\n\n');
+  return text.trim();
+}
+
+function extractLabelValue(text, labels) {
+  for (const label of labels) {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`${escaped}\\s*[:：]\\s*([^\\n]+)`);
+    const match = text.match(regex);
+    if (match && match[1]) {
+      return match[1].trim();
+    }
+  }
+  return '';
+}
+
+function splitResumeSentences(text) {
+  return String(text || '')
+    .split(/[\n；;。]/)
+    .map(item => item.trim())
+    .filter(Boolean);
+}
+
+function parseResumeStructure(markdown) {
+  const normalized = normalizeResumeSource(markdown);
+  const lines = normalized.split('\n').map(line => line.trim()).filter(Boolean);
+  const knownSections = new Set([
+    '个人信息', '个人概况', '求职意向', '教育背景', '工作经历', '实习经历',
+    '项目经历', '校园经历', '技能特长', '专业技能', '核心技能', '自我评价',
+    '荣誉奖项', '获奖经历', '证书', '语言能力'
+  ]);
+
+  const model = {
+    name: '',
+    headline: '',
+    meta: [],
+    summary: '',
+    sections: [],
+    rawLines: lines,
+  };
+
+  if (!lines.length) {
+    return model;
+  }
+
+  const joined = lines.join('\n');
+  model.name = extractLabelValue(joined, ['姓名']) || '';
+  if (!model.name) {
+    const firstLine = lines[0].replace(/^#\s*/, '');
+    if (firstLine && !knownSections.has(firstLine) && firstLine.length <= 24) {
+      model.name = firstLine;
+    }
+  }
+
+  const titleLine = extractLabelValue(joined, ['求职意向', '目标岗位', '应聘岗位']);
+  if (titleLine) {
+    model.headline = titleLine;
+  } else {
+    const secondLine = lines.find(line => /产品|运营|开发|设计|数据|经理|工程师|实习|分析/.test(line));
+    model.headline = secondLine && secondLine !== model.name ? secondLine : '';
+  }
+
+  const metaPairs = [
+    ['电话', ['联系电话', '电话', '手机']],
+    ['邮箱', ['邮箱', '电子邮件']],
+    ['微信', ['微信']],
+    ['现居地', ['现居地', '所在地', '居住地']],
+    ['学历', ['学历']],
+    ['专业', ['专业']],
+    ['学校', ['毕业院校', '学校', '在读院校']],
+    ['出生年月', ['出生年月']],
+    ['性别', ['性别']],
+  ];
+
+  model.meta = metaPairs
+    .map(([label, keys]) => {
+      const value = extractLabelValue(joined, keys);
+      return value ? `${label}：${value}` : '';
+    })
+    .filter(Boolean);
+
+  let currentSection = null;
+  const headerBuffer = [];
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/^#{1,6}\s*/, '').trim();
+    if (!line) continue;
+
+    if (knownSections.has(line)) {
+      currentSection = { title: line, items: [] };
+      model.sections.push(currentSection);
+      continue;
+    }
+
+    if (!currentSection) {
+      headerBuffer.push(line);
+      continue;
+    }
+
+    splitResumeSentences(line).forEach((item) => {
+      currentSection.items.push(item);
+    });
+  }
+
+  if (!model.summary) {
+    const summaryCandidates = headerBuffer.filter(line => (
+      line !== model.name &&
+      line !== model.headline &&
+      !/^姓名[:：]|^电话[:：]|^联系电话[:：]|^邮箱[:：]|^电子邮件[:：]|^微信[:：]|^现居地[:：]|^所在地[:：]|^学历[:：]|^专业[:：]|^学校[:：]|^毕业院校[:：]/.test(line)
+    ));
+    model.summary = summaryCandidates.slice(0, 3).join(' ');
+  }
+
+  if (!model.sections.length) {
+    const fallbackItems = splitResumeSentences(lines.join('\n'));
+    model.sections.push({
+      title: '简历内容',
+      items: fallbackItems,
+    });
+  }
+
+  model.sections = model.sections
+    .map(section => ({
+      title: section.title,
+      items: section.items.filter(Boolean),
+    }))
+    .filter(section => section.items.length > 0);
+
+  return model;
+}
+
+function renderResumeSectionItems(section, templateId) {
+  if (templateId === 'timeline') {
+    return section.items.map((item) => {
+      const isPeriod = /(?:19|20)\d{2}.*(?:至今|现在|[-~—至到])/.test(item);
+      return `
+        <div class="resume-block resume-block--timeline${isPeriod ? ' is-period' : ''}">
+          <div class="resume-block__marker"></div>
+          <div class="resume-block__content">${escapeHtml(item)}</div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  return `
+    <ul class="resume-list">
+      ${section.items.map(item => `<li>${escapeHtml(item)}</li>`).join('')}
+    </ul>
+  `;
+}
+
+function renderResumeStructuredBody(model, templateId = currentResumeTemplate) {
+  const name = model.name || '简历预览';
+  const metaHtml = model.meta.length
+    ? `<div class="resume-meta">${model.meta.map(item => `<span class="resume-meta__item">${escapeHtml(item)}</span>`).join('')}</div>`
+    : '';
+  const summaryHtml = model.summary
+    ? `<div class="resume-summary">${escapeHtml(model.summary)}</div>`
+    : '';
+  const sectionsHtml = model.sections.map((section) => `
+    <section class="resume-section">
+      <div class="resume-section__title">${escapeHtml(section.title)}</div>
+      <div class="resume-section__body">
+        ${renderResumeSectionItems(section, templateId)}
+      </div>
+    </section>
+  `).join('');
+
+  return `
+    <article class="resume-sheet resume-sheet--${escapeResumeAttr(templateId)}">
+      <header class="resume-sheet__header">
+        <div class="resume-sheet__name">${escapeHtml(name)}</div>
+        ${model.headline ? `<div class="resume-sheet__headline">${escapeHtml(model.headline)}</div>` : ''}
+        ${metaHtml}
+        ${summaryHtml}
+      </header>
+      <div class="resume-sheet__body">
+        ${sectionsHtml}
+      </div>
+    </article>
+  `;
+}
+
+function buildResumeDocumentHTML(markdown, templateId = currentResumeTemplate, { fragment = false } = {}) {
+  const safeTemplateId = RESUME_TEMPLATE_OPTIONS.some(option => option.id === templateId)
+    ? templateId
+    : 'structured';
+  const model = parseResumeStructure(markdown);
+  const body = renderResumeStructuredBody(model, safeTemplateId);
+
+  if (fragment) {
+    return body;
+  }
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>简历</title>
+  <style>${RESUME_DOCUMENT_CSS}</style>
+</head>
+<body class="resume-doc-shell">${body}</body>
+</html>`;
+}
 
 function loadResumeView() {
   const container = document.getElementById('view-resume');
@@ -711,7 +1449,6 @@ function loadResumeView() {
     ).join('');
 
     container.innerHTML = `
-      <div class="vlabel">SOVT</div>
       <div class="ws">
         <div class="ws-del">
           <h3 class="ws-del__title">收藏列表 <span id="delivery-count" class="ws-del__count"></span></h3>
@@ -786,6 +1523,7 @@ async function loadResume() {
     const contentMd = resume.content_md || '';
     container.innerHTML = renderResumeDualMode(contentMd, 'default');
     bindResumeDualModeEvents(container, 'default');
+    initializeResumePreviewShells(container);
   } catch (err) {
     currentResume = null;
     container.innerHTML = renderResumeNoContent();
@@ -805,15 +1543,16 @@ function renderResumeDualMode(contentMd, viewMode = 'default') {
   const idPrefix = viewMode === 'default' ? 'def' : 'exp';
   return `
     <div class="resume-dual-mode">
-      <div class="res-bar">
-        <button class="res-btn" id="${idPrefix}-btn-view" data-mode="view" data-view="${viewMode}">查看</button>
-        <button class="res-btn res-btn--g res-btn--active" id="${idPrefix}-btn-edit" data-mode="edit" data-view="${viewMode}">编辑</button>
+      <div class="res-bar" id="${idPrefix}-res-bar">
+        <button class="res-btn res-btn--active" id="${idPrefix}-btn-view" data-mode="view" data-view="${viewMode}">查看</button>
+        <button class="res-btn res-btn--g" id="${idPrefix}-btn-edit" data-mode="edit" data-view="${viewMode}">编辑</button>
         <button class="res-btn res-btn--g" id="${idPrefix}-btn-save" data-view="${viewMode}">保存</button>
         <button class="res-btn res-btn--ai" id="${idPrefix}-btn-ai-optimize" data-view="${viewMode}"
                 ${!aiConfigured ? 'disabled title="请先配置 AI"' : ''}>
           AI 优化简历
         </button>
         <button class="res-btn res-btn--g" id="${idPrefix}-btn-ai-cfg" data-view="${viewMode}">AI 配置</button>
+        ${renderResumeTemplateSelector(viewMode)}
         <div class="export-dropdown" id="${idPrefix}-export-dropdown">
           <button class="res-btn res-btn--export btn-export" id="${idPrefix}-btn-export-resume"
                   ${!currentResume ? 'disabled title="请先上传简历"' : ''}>
@@ -828,10 +1567,10 @@ function renderResumeDualMode(contentMd, viewMode = 'default') {
         </div>
       </div>
       <div class="resume-dual-mode__view" id="${idPrefix}-resume-view">
-        ${renderResumeHTML(contentMd)}
+        ${renderResumePreviewShell(contentMd, currentResumeTemplate, { editable: false, viewMode })}
       </div>
       <div class="resume-dual-mode__edit" id="${idPrefix}-resume-edit" style="display:none">
-        ${renderResumeEdit(contentMd)}
+        ${renderResumeEdit(contentMd, viewMode)}
       </div>
     </div>
   `;
@@ -863,102 +1602,118 @@ function initUploadButton(container) {
  * @param {string} markdown Markdown 原始文本
  * @returns {string} HTML 字符串
  */
-function renderResumeHTML(markdown) {
+function renderResumeHTML(markdown, templateId = currentResumeTemplate) {
   if (!markdown || !markdown.trim()) {
     return '<div class="resume-empty">暂无简历内容</div>';
   }
+  return buildResumeDocumentHTML(markdown, templateId, { fragment: true });
+}
 
-  const lines = markdown.split('\n');
-  const sections = [];   // 收集各个 section 的 HTML 片段
-  let currentItems = [];  // 当前正在收集的列表项
-  let currentTexts = [];  // 当前正在收集的文本行
-  let sectionTitle = '';  // 当前 section 标题（## 或 #）
-  let sectionType = '';   // 'name' | 'section' | ''
-  let inH1 = false;       // 是否在一级标题（姓名）section 内
+function renderResumePreviewShell(markdown, templateId = currentResumeTemplate, options = {}) {
+  const { editable = false, viewMode = 'default' } = options;
+  return `
+    <div class="resume-preview-shell" data-editable="${editable ? 'true' : 'false'}" data-view-mode="${escapeResumeAttr(viewMode)}">
+      <div class="resume-preview-guides"></div>
+      <div class="resume-preview-stage">
+        ${renderResumeHTML(markdown, templateId)}
+      </div>
+    </div>
+  `;
+}
 
-  // 将列表项/文本刷新为 HTML 并追加到当前 section
-  function flushContent() {
-    if (currentItems.length > 0) {
-      sections.push(`<ul class="rsec-list">${currentItems.map(t => `<li>${t}</li>`).join('')}</ul>`);
-      currentItems = [];
-    }
-    if (currentTexts.length > 0) {
-      sections.push(currentTexts.map(t => `<p class="rsec-text">${t}</p>`).join(''));
-      currentTexts = [];
-    }
+function serializeResumePreviewToMarkdown(previewRoot) {
+  if (!previewRoot) return '';
+  const sheet = previewRoot.querySelector('.resume-sheet');
+  if (!sheet) return '';
+
+  const lines = [];
+  const name = sheet.querySelector('.resume-sheet__name')?.innerText.trim();
+  const headline = sheet.querySelector('.resume-sheet__headline')?.innerText.trim();
+  if (name) lines.push(name);
+  if (headline) lines.push(headline);
+
+  const metaItems = [...sheet.querySelectorAll('.resume-meta__item')]
+    .map(el => el.innerText.trim())
+    .filter(Boolean);
+  if (metaItems.length) lines.push(...metaItems);
+
+  const summary = sheet.querySelector('.resume-summary')?.innerText.trim();
+  if (summary) {
+    lines.push('');
+    lines.push('个人概况');
+    lines.push(summary);
   }
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // 一级标题 → 姓名
-    if (/^#\s+(.+)/.test(line)) {
-      flushContent();
-      if (inH1) {
-        // 关闭前一个 H1 section
-        sections.push('</div>');
-      }
-      sectionTitle = escapeHtml(RegExp.$1.trim());
-      sectionType = 'name';
-      inH1 = true;
-      sections.push(`<div class="rsec"><div class="rsec-name">${sectionTitle}</div>`);
-      continue;
-    }
-
-    // 二级标题 → 章节标题
-    if (/^##\s+(.+)/.test(line)) {
-      flushContent();
-      if (inH1) {
-        // 关闭 H1 section
-        sections.push('</div>');
-        inH1 = false;
-      } else if (sectionType === 'section') {
-        // 关闭前一个普通 section
-        sections.push('</div>');
-      }
-      sectionTitle = escapeHtml(RegExp.$1.trim());
-      sectionType = 'section';
-      sections.push(`<div class="rsec"><div class="rsec-hd">${sectionTitle}</div>`);
-      continue;
-    }
-
-    // 三级标题 → 子标题
-    if (/^###\s+(.+)/.test(line)) {
-      flushContent();
-      const text = escapeHtml(RegExp.$1.trim());
-      sections.push(`<div class="rsec-name" style="font-size:16px">${text}</div>`);
-      continue;
-    }
-
-    // 无序列表项
-    if (/^-\s+(.+)/.test(line)) {
-      currentTexts = [];  // 列表优先，清空文本缓冲
-      currentItems.push(escapeHtml(RegExp.$1.trim()));
-      continue;
-    }
-
-    // 空行 → 忽略（同时刷新缓冲）
-    if (line.trim() === '') {
-      if (currentItems.length > 0 || currentTexts.length > 0) {
-        flushContent();
-      }
-      continue;
-    }
-
-    // 普通文本
-    currentItems = [];  // 文本优先，清空列表缓冲
-    currentTexts.push(escapeHtml(line.trim()));
+  const sections = [...sheet.querySelectorAll('.resume-section')];
+  for (const section of sections) {
+    const title = section.querySelector('.resume-section__title')?.innerText.trim();
+    const items = [
+      ...section.querySelectorAll('.resume-list li, .resume-block__content')
+    ].map(el => el.innerText.trim()).filter(Boolean);
+    if (!title && !items.length) continue;
+    lines.push('');
+    if (title) lines.push(title);
+    for (const item of items) lines.push(`- ${item}`);
   }
 
-  // 刷新最后的内容
-  flushContent();
+  return normalizeResumeSource(lines.join('\n'));
+}
 
-  // 关闭最后一个未闭合的 section
-  if (inH1 || sectionType === 'section') {
-    sections.push('</div>');
+function syncResumeEditorDraft(editEl) {
+  if (!editEl) return '';
+  const previewEl = editEl.querySelector('.resume-edit-dual__preview');
+  const ta = editEl.querySelector('textarea');
+  const contentMd = serializeResumePreviewToMarkdown(previewEl);
+  if (ta) ta.value = contentMd;
+  return contentMd;
+}
+
+function updateResumePageGuides(shell) {
+  if (!shell) return;
+  const stage = shell.querySelector('.resume-preview-stage');
+  const sheet = shell.querySelector('.resume-sheet');
+  const guides = shell.querySelector('.resume-preview-guides');
+  if (!stage || !sheet || !guides) return;
+
+  const pageHeight = Math.max(1, Math.round(sheet.offsetWidth * Math.SQRT2));
+  const totalHeight = Math.max(stage.scrollHeight, sheet.offsetHeight);
+  guides.innerHTML = '';
+
+  for (let y = pageHeight; y < totalHeight; y += pageHeight) {
+    const line = document.createElement('div');
+    line.className = 'resume-page-guide';
+    line.style.top = `${y}px`;
+    line.innerHTML = `<span>PDF 第 ${Math.round(y / pageHeight) + 1} 页起点</span>`;
+    guides.appendChild(line);
   }
+}
 
-  return sections.join('');
+function initializeResumePreviewShells(root = document) {
+  root.querySelectorAll('.resume-preview-shell').forEach((shell) => {
+    const editable = shell.dataset.editable === 'true';
+    const stage = shell.querySelector('.resume-preview-stage');
+    const sheet = shell.querySelector('.resume-sheet');
+    if (!stage || !sheet) return;
+
+    if (editable) {
+      sheet.setAttribute('contenteditable', 'true');
+      sheet.setAttribute('spellcheck', 'false');
+      if (!sheet.dataset.editorBound) {
+        const sync = () => {
+          const editEl = shell.closest('.resume-dual-mode__edit');
+          syncResumeEditorDraft(editEl);
+          updateResumePageGuides(shell);
+        };
+        sheet.addEventListener('input', sync);
+        sheet.addEventListener('blur', sync, true);
+        sheet.dataset.editorBound = 'true';
+      }
+    } else {
+      sheet.removeAttribute('contenteditable');
+    }
+
+    updateResumePageGuides(shell);
+  });
 }
 
 /**
@@ -966,8 +1721,21 @@ function renderResumeHTML(markdown) {
  * @param {string} contentMd Markdown 原始文本
  * @returns {string} HTML 字符串
  */
-function renderResumeEdit(contentMd) {
-  return `<textarea class="res-ta" id="resume-edit-ta">${escapeHtml(contentMd || '')}</textarea>`;
+function renderResumeEdit(contentMd, viewMode = 'default') {
+  const isSplit = viewMode === 'split';
+  const idPrefix = viewMode === 'default' ? 'def' : (isSplit ? 'sp' : 'exp');
+  const taId = isSplit ? 'sp-resume-edit-ta' : (viewMode === 'default' ? 'resume-edit-ta' : 'resume-edit-ta-exp');
+  const previewId = `${idPrefix}-resume-edit-preview`;
+  const previewMaxHeight = isSplit ? '300px' : '600px';
+  return `
+    <div class="resume-edit-dual" style="display:flex;flex-direction:column;gap:16px;align-items:stretch;">
+      <div class="resume-edit-dual__input" style="display:none">
+        <textarea class="res-ta resume-source-buffer" id="${taId}">${escapeHtml(contentMd || '')}</textarea>
+      </div>
+      <div class="resume-edit-dual__preview" id="${previewId}" style="flex:1;min-width:0;max-height:${previewMaxHeight};overflow-y:auto;border:2px solid var(--c-black);">
+        ${renderResumePreviewShell(contentMd, currentResumeTemplate, { editable: true, viewMode })}
+      </div>
+    </div>`;
 }
 
 /**
@@ -1002,15 +1770,15 @@ function toggleResumeMode(mode, viewMode = 'default') {
     editEl.style.display = 'block';
     if (btnView) { btnView.classList.remove('res-btn--active'); }
     if (btnEdit) { btnEdit.classList.add('res-btn--active'); }
+    initializeResumePreviewShells(editEl);
   } else {
-    // 切换到查看模式时，从 textarea 同步内容到 HTML 渲染
-    const ta = editEl.querySelector('textarea');
-    const newMd = ta ? ta.value : (currentResume ? currentResume.content_md || '' : '');
-    viewEl.innerHTML = renderResumeHTML(newMd);
+    const newMd = syncResumeEditorDraft(editEl) || (currentResume ? currentResume.content_md || '' : '');
+    viewEl.innerHTML = renderResumePreviewShell(newMd, currentResumeTemplate, { editable: false, viewMode });
     viewEl.style.display = 'block';
     editEl.style.display = 'none';
     if (btnView) { btnView.classList.add('res-btn--active'); }
     if (btnEdit) { btnEdit.classList.remove('res-btn--active'); }
+    initializeResumePreviewShells(viewEl);
   }
 
   currentResumeMode = mode;
@@ -1021,23 +1789,31 @@ function toggleResumeMode(mode, viewMode = 'default') {
  * @param {'default'|'expanded'} viewMode 视图模式
  */
 async function saveResumeContent(viewMode = 'default') {
-  const idPrefix = viewMode === 'default' ? 'def' : 'exp';
+  const ID_PREFIX_MAP = { default: 'def', expanded: 'exp', split: 'sp' };
+  const idPrefix = ID_PREFIX_MAP[viewMode] || 'def';
   const editEl = document.getElementById(`${idPrefix}-resume-edit`);
   const ta = editEl ? editEl.querySelector('textarea') : null;
+  const saveBtn = document.getElementById(`${idPrefix}-btn-save`);
 
   if (!ta) {
     showToast('未找到编辑区域', 'error');
     return;
   }
 
-  const contentMd = ta.value;
+  const contentMd = syncResumeEditorDraft(editEl) || ta.value;
   if (!contentMd.trim()) {
     showToast('简历内容不能为空', 'error');
     return;
   }
 
+  const originalSaveLabel = saveBtn ? saveBtn.textContent : '';
+
   try {
-    const data = await updateResumeContent(contentMd);
+    if (saveBtn) {
+      saveBtn.disabled = true;
+      saveBtn.textContent = '保存中...';
+    }
+    await updateResumeContent(contentMd);
     showToast('简历保存成功', 'success');
 
     // 更新本地缓存
@@ -1053,6 +1829,11 @@ async function saveResumeContent(viewMode = 'default') {
       showToast('请先上传简历', 'error');
     } else {
       showToast('保存失败: ' + err.message, 'error');
+    }
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = originalSaveLabel || '保存';
     }
   }
 }
@@ -1098,9 +1879,14 @@ async function handleAIOptimize(btn, viewMode = 'default') {
       const idPrefix = viewMode === 'default' ? 'def' : 'exp';
       const editEl = document.getElementById(`${idPrefix}-resume-edit`);
       const ta = editEl ? editEl.querySelector('textarea') : null;
+      const previewEl = editEl ? editEl.querySelector('.resume-edit-dual__preview') : null;
 
       if (ta) {
         ta.value = optimizedContent;
+      }
+      if (previewEl) {
+        previewEl.innerHTML = renderResumePreviewShell(optimizedContent, currentResumeTemplate, { editable: true, viewMode });
+        initializeResumePreviewShells(editEl);
       }
 
       // 更新本地缓存
@@ -1142,119 +1928,210 @@ function triggerDownload(blob, filename) {
 
 /* --- HTML 导出模板（Constructivism 风格，与 WP3 后端共用） --- */
 
-const RESUME_HTML_TEMPLATE = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>简历</title>
-  <style>
-    /* Constructivism（构成主义）色彩体系 */
-    :root {
-      --c-red: #E62B1E;
-      --c-black: #1A1A1A;
-      --c-paper: #F4F0EA;
-      --c-yellow: #FFC72C;
-      --c-gray: #8E8E8E;
-      --c-white: #FFFFFF;
+const RESUME_DOCUMENT_CSS = `
+  :root {
+    --resume-bg: #f7f3ec;
+    --resume-ink: #1a1a1a;
+    --resume-accent: #e4432c;
+    --resume-accent-soft: #ffcc33;
+    --resume-border: #222;
+    --resume-muted: #666;
+    --resume-paper: #fffdf9;
+  }
+
+  * { box-sizing: border-box; }
+
+  body.resume-doc-shell {
+    margin: 0;
+    padding: 24px;
+    background: var(--resume-bg);
+    color: var(--resume-ink);
+    font-family: 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
+  }
+
+  .resume-sheet {
+    width: 100%;
+    max-width: 980px;
+    margin: 0 auto;
+    background: var(--resume-paper);
+    border: 3px solid var(--resume-border);
+    box-shadow: 14px 14px 0 rgba(26, 26, 26, 0.08);
+    overflow: hidden;
+  }
+
+  .resume-sheet--structured .resume-sheet__header {
+    padding: 36px 42px 24px;
+    background:
+      linear-gradient(135deg, rgba(228, 67, 44, 0.08), transparent 42%),
+      linear-gradient(0deg, #fffdf9, #fffdf9);
+    border-bottom: 4px solid var(--resume-accent);
+  }
+
+  .resume-sheet--timeline .resume-sheet__header {
+    padding: 38px 42px 30px;
+    background: #171717;
+    color: #fffaf0;
+    border-bottom: 6px solid var(--resume-accent-soft);
+  }
+
+  .resume-sheet__name {
+    margin: 0;
+    font-size: 34px;
+    line-height: 1.15;
+    font-weight: 900;
+    letter-spacing: 1px;
+  }
+
+  .resume-sheet__headline {
+    margin-top: 10px;
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--resume-accent);
+  }
+
+  .resume-sheet--timeline .resume-sheet__headline {
+    color: var(--resume-accent-soft);
+  }
+
+  .resume-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 16px;
+  }
+
+  .resume-meta__item {
+    display: inline-flex;
+    align-items: center;
+    min-height: 30px;
+    padding: 4px 10px;
+    border: 2px solid var(--resume-border);
+    background: rgba(255, 255, 255, 0.88);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .resume-sheet--timeline .resume-meta__item {
+    color: #fffaf0;
+    border-color: var(--resume-accent-soft);
+    background: transparent;
+  }
+
+  .resume-summary {
+    margin-top: 18px;
+    font-size: 14px;
+    line-height: 1.8;
+    color: var(--resume-muted);
+  }
+
+  .resume-sheet--timeline .resume-summary {
+    color: rgba(255, 250, 240, 0.82);
+  }
+
+  .resume-sheet__body {
+    padding: 28px 42px 36px;
+    display: grid;
+    gap: 18px;
+  }
+
+  .resume-sheet--timeline .resume-sheet__body {
+    background:
+      linear-gradient(90deg, rgba(255, 204, 51, 0.16) 0, rgba(255, 204, 51, 0.16) 4px, transparent 4px, transparent 100%);
+  }
+
+  .resume-section {
+    border: 2px solid var(--resume-border);
+    padding: 18px 20px;
+    background: #fff;
+  }
+
+  .resume-sheet--timeline .resume-section {
+    background: rgba(255, 255, 255, 0.96);
+    margin-left: 18px;
+  }
+
+  .resume-section__title {
+    display: inline-block;
+    margin-bottom: 14px;
+    padding: 0 0 6px;
+    border-bottom: 4px solid var(--resume-accent);
+    font-size: 14px;
+    font-weight: 900;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+
+  .resume-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: grid;
+    gap: 10px;
+  }
+
+  .resume-list li {
+    position: relative;
+    padding-left: 16px;
+    font-size: 14px;
+    line-height: 1.8;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .resume-list li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 11px;
+    width: 8px;
+    height: 3px;
+    background: var(--resume-accent);
+  }
+
+  .resume-block {
+    position: relative;
+    padding-left: 24px;
+    margin-bottom: 12px;
+  }
+
+  .resume-block:last-child {
+    margin-bottom: 0;
+  }
+
+  .resume-block__marker {
+    position: absolute;
+    left: 0;
+    top: 8px;
+    width: 10px;
+    height: 10px;
+    border: 2px solid var(--resume-border);
+    background: var(--resume-accent-soft);
+  }
+
+  .resume-block.is-period .resume-block__marker {
+    background: var(--resume-accent);
+  }
+
+  .resume-block__content {
+    font-size: 14px;
+    line-height: 1.8;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  @media print {
+    body.resume-doc-shell {
+      padding: 0;
+      background: #fff;
     }
 
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-
-    body {
-      font-family: 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: var(--c-paper);
-      color: var(--c-black);
-      line-height: 1.7;
-      padding: 48px 60px;
-      max-width: 900px;
-      margin: 0 auto;
-    }
-
-    h1, h2, h3, h4, h5, h6 {
-      font-family: 'Courier New', 'Noto Sans SC', monospace;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      font-weight: 900;
-      border-bottom: 3px solid var(--c-black);
-      padding-bottom: 6px;
-      margin: 28px 0 14px;
-    }
-    h1 { font-size: 28px; margin-top: 0; border-bottom-width: 4px; }
-    h2 { font-size: 22px; color: var(--c-red); }
-    h3 { font-size: 18px; }
-    h4 { font-size: 16px; }
-
-    p { margin: 8px 0; }
-
-    ul, ol { margin: 8px 0 8px 24px; }
-    li { margin: 4px 0; }
-
-    strong, b { color: var(--c-red); font-weight: 700; }
-
-    a { color: var(--c-red); text-decoration: none; border-bottom: 2px solid var(--c-yellow); }
-    a:hover { border-bottom-color: var(--c-red); }
-
-    blockquote {
-      border-left: 4px solid var(--c-black);
-      padding: 8px 16px;
-      margin: 12px 0;
-      background: var(--c-white);
-      font-style: italic;
-    }
-
-    code {
-      font-family: 'Courier New', monospace;
-      background: var(--c-black);
-      color: var(--c-yellow);
-      padding: 2px 6px;
-      font-size: 0.9em;
-    }
-
-    pre {
-      background: var(--c-black);
-      color: var(--c-paper);
-      padding: 16px;
-      margin: 12px 0;
-      overflow-x: auto;
-      font-family: 'Courier New', monospace;
-      font-size: 13px;
-      line-height: 1.5;
-    }
-    pre code { background: none; color: inherit; padding: 0; }
-
-    hr {
+    .resume-sheet {
       border: none;
-      border-top: 3px solid var(--c-black);
-      margin: 24px 0;
+      box-shadow: none;
+      max-width: none;
     }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin: 12px 0;
-    }
-    th, td {
-      border: 2px solid var(--c-black);
-      padding: 8px 12px;
-      text-align: left;
-    }
-    th {
-      background: var(--c-black);
-      color: var(--c-paper);
-      font-weight: 700;
-    }
-
-    @media print {
-      body { padding: 0; max-width: none; }
-      h1, h2, h3, h4, h5, h6 { page-break-after: avoid; }
-    }
-  </style>
-</head>
-<body>
-{BODY}
-</body>
-</html>`;
+  }
+`;
 
 /**
  * 简单 Markdown 转 HTML（零依赖，覆盖简历常用语法）
@@ -1403,8 +2280,7 @@ function exportResumeAsMarkdown(contentMd, fileName) {
  */
 function exportResumeAsHTML(contentMd, fileName) {
   const baseName = extractBaseName(fileName);
-  const bodyHtml = markdownToHtml(contentMd);
-  const fullHtml = RESUME_HTML_TEMPLATE.replace('{BODY}', bodyHtml);
+  const fullHtml = buildResumeDocumentHTML(contentMd, currentResumeTemplate);
   const blob = new Blob([fullHtml], { type: 'text/html;charset=utf-8' });
   triggerDownload(blob, `${baseName}.html`);
   showToast('HTML 文件已下载', 'success');
@@ -1416,7 +2292,11 @@ function exportResumeAsHTML(contentMd, fileName) {
 async function exportResumeAsPDF(contentMd, fileName) {
   showToast('正在生成 PDF...', 'info');
   try {
-    const blob = await exportPDFViaAPI(contentMd);
+    const blob = await exportPDFViaAPI({
+      content_md: contentMd,
+      content_html: buildResumeDocumentHTML(contentMd, currentResumeTemplate),
+      template_id: currentResumeTemplate,
+    });
     const baseName = extractBaseName(fileName);
     triggerDownload(blob, `${baseName}.pdf`);
     showToast('PDF 文件已下载', 'success');
@@ -1587,8 +2467,25 @@ async function exportResumeAsDocx(contentMd, fileName) {
  * 根据格式分发导出逻辑
  * @param {string} format 导出格式 (md/html/pdf/docx)
  */
+function getCurrentResumeDraft() {
+  const editors = ['def-resume-edit', 'exp-resume-edit', 'sp-resume-edit'];
+  for (const editorId of editors) {
+    const editor = document.getElementById(editorId);
+    if (!editor) continue;
+    const previewDraft = syncResumeEditorDraft(editor);
+    if (previewDraft.trim()) {
+      return previewDraft;
+    }
+    const textarea = editor.querySelector('textarea');
+    if (textarea && textarea.value.trim()) {
+      return textarea.value;
+    }
+  }
+  return currentResume ? currentResume.content_md || '' : '';
+}
+
 function dispatchExport(format) {
-  const contentMd = currentResume ? currentResume.content_md || '' : '';
+  const contentMd = getCurrentResumeDraft();
   if (!contentMd.trim()) {
     showToast('暂无简历内容可导出', 'error');
     return;
@@ -1666,11 +2563,48 @@ function bindResumeDualModeEvents(container, viewMode = 'default') {
 
   // 绑定 AI 配置切换按钮
   const idPrefix = viewMode === 'default' ? 'def' : 'exp';
+  const templateSelect = container.querySelector(`#${idPrefix}-resume-template`);
   const aiCfgBtn = container.querySelector(`#${idPrefix}-btn-ai-cfg`);
   if (aiCfgBtn) {
     aiCfgBtn.addEventListener('click', () => {
       const cfgPanel = document.getElementById('wsAICfg');
       if (cfgPanel) cfgPanel.classList.toggle('on');
+    });
+  }
+
+  if (templateSelect) {
+    templateSelect.addEventListener('change', () => {
+      persistResumeTemplate(templateSelect.value);
+      const viewEl = document.getElementById(`${idPrefix}-resume-view`);
+      const editEl = document.getElementById(`${idPrefix}-resume-edit`);
+      const ta = editEl ? editEl.querySelector('textarea') : null;
+      const contentMd = syncResumeEditorDraft(editEl) || (ta ? ta.value : (currentResume ? currentResume.content_md || '' : ''));
+      if (viewEl) {
+        viewEl.innerHTML = renderResumePreviewShell(contentMd, currentResumeTemplate, { editable: false, viewMode });
+        initializeResumePreviewShells(viewEl);
+      }
+      const editPreview = editEl ? editEl.querySelector('.resume-edit-dual__preview') : null;
+      if (editPreview) {
+        editPreview.innerHTML = renderResumePreviewShell(contentMd, currentResumeTemplate, { editable: true, viewMode });
+        initializeResumePreviewShells(editEl);
+      }
+      const splitSelect = document.getElementById('sp-resume-template');
+      if (splitSelect) {
+        splitSelect.value = currentResumeTemplate;
+      }
+      const splitView = document.getElementById('sp-resume-view');
+      const splitEdit = document.getElementById('sp-resume-edit');
+      const splitTa = splitEdit ? splitEdit.querySelector('textarea') : null;
+      const splitContentMd = syncResumeEditorDraft(splitEdit) || (splitTa ? splitTa.value : contentMd);
+      if (splitView) {
+        splitView.innerHTML = renderResumePreviewShell(splitContentMd, currentResumeTemplate, { editable: false, viewMode: 'split' });
+        initializeResumePreviewShells(splitView);
+      }
+      const splitEditPreview = splitEdit ? splitEdit.querySelector('.resume-edit-dual__preview') : null;
+      if (splitEditPreview) {
+        splitEditPreview.innerHTML = renderResumePreviewShell(splitContentMd, currentResumeTemplate, { editable: true, viewMode: 'split' });
+        initializeResumePreviewShells(splitEdit);
+      }
     });
   }
 
@@ -1995,12 +2929,20 @@ function loadSplitRight() {
   container.innerHTML = `
     <h3>简历内容</h3>
     <div class="res-bar" id="splitResBar">
-      <button class="res-btn" id="sp-btn-view" data-mode="view">查看</button>
-      <button class="res-btn res-btn--g res-btn--active" id="sp-btn-edit" data-mode="edit">编辑</button>
+      <button class="res-btn res-btn--active" id="sp-btn-view" data-mode="view">查看</button>
+      <button class="res-btn res-btn--g" id="sp-btn-edit" data-mode="edit">编辑</button>
       <button class="res-btn res-btn--g" id="sp-btn-save">保存</button>
       <button class="res-btn res-btn--ai" id="sp-btn-ai-optimize"
               ${!aiConfigured ? 'disabled title="请先配置 AI"' : ''}>AI 优化</button>
       <button class="res-btn res-btn--g" id="sp-btn-ai-cfg">AI 配置</button>
+      <label class="resume-template-switch" for="sp-resume-template">
+        <span>模板</span>
+        <select class="resume-template-switch__select" id="sp-resume-template">
+          ${RESUME_TEMPLATE_OPTIONS.map(option => `
+            <option value="${option.id}" ${option.id === currentResumeTemplate ? 'selected' : ''}>${option.label}</option>
+          `).join('')}
+        </select>
+      </label>
     </div>
     <div id="sp-resume-view" class="resume-dual-mode__view"></div>
     <div id="sp-resume-edit" class="resume-dual-mode__edit" style="display:none"></div>
@@ -2057,9 +2999,11 @@ async function loadSplitResume() {
     const contentMd = resume.content_md || '';
 
     // 查看模式渲染
-    viewEl.innerHTML = renderResumeHTML(contentMd);
-    // 编辑模式填充
-    editEl.innerHTML = `<textarea class="res-ta">${escapeHtml(contentMd || '')}</textarea>`;
+    viewEl.innerHTML = renderResumePreviewShell(contentMd, currentResumeTemplate, { editable: false, viewMode: 'split' });
+    // 编辑模式填充（双栏：上下布局，适应分屏窄宽度）
+    editEl.innerHTML = renderResumeEdit(contentMd, 'split');
+    initializeResumePreviewShells(viewEl);
+    initializeResumePreviewShells(editEl);
   } catch (err) {
     viewEl.innerHTML = `<div class="resume-empty">加载简历失败: ${escapeHtml(err.message)}</div>`;
   }
@@ -2076,6 +3020,7 @@ function bindSplitEvents() {
   const aiCfgBtn = document.getElementById('sp-btn-ai-cfg');
   const dlBtn = document.getElementById('sp-dl-btn');
   const dlFormat = document.getElementById('sp-dl-format');
+  const templateSelect = document.getElementById('sp-resume-template');
   const aiSaveBtn = document.getElementById('sp-ai-save-btn');
   const spProvider = document.getElementById('sp-ai-provider');
 
@@ -2086,15 +3031,14 @@ function bindSplitEvents() {
       const editEl = document.getElementById('sp-resume-edit');
       if (!viewEl || !editEl) return;
 
-      // 从 textarea 同步到查看视图
-      const ta = editEl.querySelector('textarea');
-      const newMd = ta ? ta.value : (currentResume ? currentResume.content_md || '' : '');
-      viewEl.innerHTML = renderResumeHTML(newMd);
+      const newMd = syncResumeEditorDraft(editEl) || (currentResume ? currentResume.content_md || '' : '');
+      viewEl.innerHTML = renderResumePreviewShell(newMd, currentResumeTemplate, { editable: false, viewMode: 'split' });
 
       viewEl.style.display = '';
       editEl.style.display = 'none';
       viewBtn.classList.add('res-btn--active');
       editBtn.classList.remove('res-btn--active');
+      initializeResumePreviewShells(viewEl);
     });
 
     editBtn.addEventListener('click', () => {
@@ -2106,6 +3050,7 @@ function bindSplitEvents() {
       editEl.style.display = '';
       editBtn.classList.add('res-btn--active');
       viewBtn.classList.remove('res-btn--active');
+      initializeResumePreviewShells(editEl);
     });
   }
 
@@ -2116,7 +3061,7 @@ function bindSplitEvents() {
       const ta = editEl ? editEl.querySelector('textarea') : null;
       if (!ta) { showToast('未找到编辑区域', 'error'); return; }
 
-      const contentMd = ta.value;
+      const contentMd = syncResumeEditorDraft(editEl) || ta.value;
       if (!contentMd.trim()) { showToast('简历内容不能为空', 'error'); return; }
 
       try {
@@ -2127,11 +3072,12 @@ function bindSplitEvents() {
         // 切换到查看模式
         const viewEl = document.getElementById('sp-resume-view');
         if (viewEl) {
-          viewEl.innerHTML = renderResumeHTML(contentMd);
+          viewEl.innerHTML = renderResumePreviewShell(contentMd, currentResumeTemplate, { editable: false, viewMode: 'split' });
           viewEl.style.display = '';
           editEl.style.display = 'none';
           if (viewBtn) viewBtn.classList.add('res-btn--active');
           if (editBtn) editBtn.classList.remove('res-btn--active');
+          initializeResumePreviewShells(viewEl);
         }
       } catch (err) {
         if (err.message && err.message.includes('No resume record found')) {
@@ -2166,7 +3112,14 @@ function bindSplitEvents() {
         if (optimizedContent) {
           const editEl = document.getElementById('sp-resume-edit');
           const ta = editEl ? editEl.querySelector('textarea') : null;
-          if (ta) ta.value = optimizedContent;
+          const previewEl = editEl ? editEl.querySelector('.resume-edit-dual__preview') : null;
+          if (ta) {
+            ta.value = optimizedContent;
+          }
+          if (previewEl) {
+            previewEl.innerHTML = renderResumePreviewShell(optimizedContent, currentResumeTemplate, { editable: true, viewMode: 'split' });
+            initializeResumePreviewShells(editEl);
+          }
           if (currentResume) currentResume.content_md = optimizedContent;
 
           // 切换到编辑模式
@@ -2194,6 +3147,42 @@ function bindSplitEvents() {
     aiCfgBtn.addEventListener('click', () => {
       const cfgPanel = document.getElementById('spAICfg');
       if (cfgPanel) cfgPanel.classList.toggle('on');
+    });
+  }
+
+  if (templateSelect) {
+    templateSelect.addEventListener('change', () => {
+      persistResumeTemplate(templateSelect.value);
+      const defaultSelect = document.getElementById('def-resume-template');
+      if (defaultSelect) {
+        defaultSelect.value = currentResumeTemplate;
+      }
+      const viewEl = document.getElementById('sp-resume-view');
+      const editEl = document.getElementById('sp-resume-edit');
+      const ta = editEl ? editEl.querySelector('textarea') : null;
+      const contentMd = syncResumeEditorDraft(editEl) || (ta ? ta.value : (currentResume ? currentResume.content_md || '' : ''));
+      if (viewEl) {
+        viewEl.innerHTML = renderResumePreviewShell(contentMd, currentResumeTemplate, { editable: false, viewMode: 'split' });
+        initializeResumePreviewShells(viewEl);
+      }
+      const editPreview = editEl ? editEl.querySelector('.resume-edit-dual__preview') : null;
+      if (editPreview) {
+        editPreview.innerHTML = renderResumePreviewShell(contentMd, currentResumeTemplate, { editable: true, viewMode: 'split' });
+        initializeResumePreviewShells(editEl);
+      }
+      const mainView = document.getElementById('def-resume-view');
+      const mainEdit = document.getElementById('def-resume-edit');
+      const mainTa = mainEdit ? mainEdit.querySelector('textarea') : null;
+      const mainContentMd = syncResumeEditorDraft(mainEdit) || (mainTa ? mainTa.value : contentMd);
+      if (mainView) {
+        mainView.innerHTML = renderResumePreviewShell(mainContentMd, currentResumeTemplate, { editable: false, viewMode: 'default' });
+        initializeResumePreviewShells(mainView);
+      }
+      const mainEditPreview = mainEdit ? mainEdit.querySelector('.resume-edit-dual__preview') : null;
+      if (mainEditPreview) {
+        mainEditPreview.innerHTML = renderResumePreviewShell(mainContentMd, currentResumeTemplate, { editable: true, viewMode: 'default' });
+        initializeResumePreviewShells(mainEdit);
+      }
     });
   }
 
@@ -2787,8 +3776,61 @@ function initCrawlPanel() {
 /* ==================== 初始化 ==================== */
 
 export function initDashboard() {
-  initRouter();
-  bindCardClickEvents();
+  openDashboardSession()
+    .catch((error) => {
+      console.warn('[Dashboard] Failed to notify ui_open:', error.message);
+    })
+    .finally(() => {
+      initRouter();
+      bindCardClickEvents();
+    });
 }
 
 initDashboard();
+
+async function notifyControllerSessionEvent(event) {
+  if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.sendMessage) {
+    return;
+  }
+
+  await chrome.runtime.sendMessage({
+    type: 'CONTROLLER_SESSION_EVENT',
+    event,
+    clientId: DASHBOARD_CLIENT_ID,
+    source: 'dashboard'
+  });
+}
+
+async function openDashboardSession() {
+  if (dashboardSessionOpened) return;
+  try {
+    if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+      await chrome.runtime.sendMessage({
+        type: 'WAKE_UP_CONTROLLER',
+        reason: 'dashboard_open'
+      });
+    }
+  } catch (error) {
+    console.warn('[Dashboard] Failed to wake Controller on open:', error.message);
+  }
+
+  dashboardSessionOpened = true;
+  await notifyControllerSessionEvent('ui_open');
+}
+
+function closeDashboardSession() {
+  if (!dashboardSessionOpened) return;
+  dashboardSessionOpened = false;
+  if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.sendMessage) {
+    return;
+  }
+
+  chrome.runtime.sendMessage({
+    type: 'CONTROLLER_SESSION_EVENT',
+    event: 'ui_close',
+    clientId: DASHBOARD_CLIENT_ID,
+    source: 'dashboard'
+  }).catch(() => {});
+}
+
+window.addEventListener('pagehide', closeDashboardSession);
