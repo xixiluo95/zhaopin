@@ -1010,13 +1010,17 @@ const server = http.createServer(async (req, res) => {
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString());
 
-        if (!body.content_md) {
+        if (!body.content_md && !body.content_html) {
           res.writeHead(400);
-          res.end(JSON.stringify({ error: 'Missing content_md field' }));
+          res.end(JSON.stringify({ error: 'Missing content_md or content_html field' }));
           return;
         }
 
-        const pdfBuffer = await exportPDF(body.content_md);
+        const pdfBuffer = await exportPDF({
+          content_md: body.content_md || '',
+          content_html: body.content_html || '',
+          template_id: body.template_id || '',
+        });
 
         res.setHeader('Content-Type', 'application/pdf');
         res.setHeader('Content-Disposition', 'attachment; filename="resume.pdf"');
@@ -1049,8 +1053,38 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === '/api/ai/assistant' && req.method === 'POST') {
+    aiHandler.handleAssistantChat(req, res);
+    return;
+  }
+
   if (url.pathname === '/api/ai/match' && req.method === 'POST') {
     aiHandler.handleJobMatch(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/ai/deep-think' && req.method === 'POST') {
+    aiHandler.handleDeepThink(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/ai/deep-think/config' && req.method === 'POST') {
+    aiHandler.handleSaveDeepThinkConfig(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/ai/secondary-model' && req.method === 'POST') {
+    aiHandler.handleSaveSecondaryModel(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/ai/secondary-model' && req.method === 'DELETE') {
+    aiHandler.handleDeleteSecondaryModel(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/ai/keyword-score' && req.method === 'POST') {
+    aiHandler.handleKeywordScore(req, res);
     return;
   }
 
