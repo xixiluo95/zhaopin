@@ -1190,6 +1190,97 @@ const RESUME_TEMPLATE_OPTIONS = [
 ];
 let currentResumeTemplate = readStoredResumeTemplate();
 
+// AI 助手会话管理 - 按岗位持久化
+const ASSISTANT_SESSIONS_KEY = 'zhaopin_assistant_sessions';
+
+function loadAssistantSessions() {
+  try {
+    const raw = localStorage.getItem(ASSISTANT_SESSIONS_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch { return {}; }
+}
+
+function saveAssistantSession(jobId, messages) {
+  try {
+    const sessions = loadAssistantSessions();
+    sessions[jobId] = {
+      messages: messages.slice(-50), // 最多保留50条
+      updatedAt: Date.now(),
+    };
+    localStorage.setItem(ASSISTANT_SESSIONS_KEY, JSON.stringify(sessions));
+  } catch (e) { console.warn('[AI Session] save failed:', e); }
+}
+
+function loadAssistantSession(jobId) {
+  const sessions = loadAssistantSessions();
+  return sessions[jobId]?.messages || [];
+}
+
+function clearAssistantSession(jobId) {
+  try {
+    const sessions = loadAssistantSessions();
+    delete sessions[jobId];
+    localStorage.setItem(ASSISTANT_SESSIONS_KEY, JSON.stringify(sessions));
+  } catch {}
+}
+
+function clearAllAssistantSessions() {
+  try { localStorage.removeItem(ASSISTANT_SESSIONS_KEY); } catch {}
+}
+
+// 统一简历状态入口
+function getCurrentResumeDraft() {
+  // 如果有编辑中的 textarea，以它为准
+  const splitEdit = document.getElementById('sp-resume-edit');
+  if (splitEdit) {
+    const ta = splitEdit.querySelector('textarea');
+    if (ta && ta.value.trim() && splitEdit.style.display !== 'none') {
+      return ta.value;
+    }
+  }
+  const defEdit = document.getElementById('def-resume-edit');
+  if (defEdit) {
+    const ta = defEdit.querySelector('textarea');
+    if (ta && ta.value.trim() && defEdit.style.display !== 'none') {
+      return ta.value;
+    }
+  }
+  return currentResumeDraftMd || (currentResume ? currentResume.content_md || '' : '');
+}
+
+function refreshAllResumeViews() {
+  const md = currentResumeDraftMd;
+  if (!md) return;
+
+  // 刷新 split center view
+  const spView = document.getElementById('sp-resume-view');
+  if (spView) {
+    spView.innerHTML = renderResumePreviewShell(md, currentResumeTemplate, { editable: false, viewMode: 'split' });
+    initializeResumePreviewShells(spView);
+  }
+
+  // 刷新 split center edit textarea
+  const spEdit = document.getElementById('sp-resume-edit');
+  if (spEdit) {
+    const ta = spEdit.querySelector('textarea');
+    if (ta) ta.value = md;
+  }
+
+  // 刷新 workspace (default) view
+  const defView = document.getElementById('def-resume-view');
+  if (defView) {
+    defView.innerHTML = renderResumePreviewShell(md, currentResumeTemplate, { editable: false, viewMode: 'default' });
+    initializeResumePreviewShells(defView);
+  }
+
+  // 刷新 workspace edit textarea
+  const defEdit = document.getElementById('def-resume-edit');
+  if (defEdit) {
+    const ta = defEdit.querySelector('textarea');
+    if (ta) ta.value = md;
+  }
+}
+
 function readStoredResumeTemplate() {
   try {
     const saved = localStorage.getItem(RESUME_TEMPLATE_STORAGE_KEY);
@@ -2977,22 +3068,6 @@ async function exportResumeAsDocx(contentMd, fileName) {
  * 根据格式分发导出逻辑
  * @param {string} format 导出格式 (md/html/pdf/docx)
  */
-function getCurrentResumeDraft() {
-  // 如果处于编辑模式，先尝试从可见的 textarea 读取
-  const editors = ['sp-resume-edit', 'def-resume-edit', 'exp-resume-edit'];
-  for (const editorId of editors) {
-    const editor = document.getElementById(editorId);
-    if (!editor || editor.style.display === 'none') continue;
-    const textarea = editor.querySelector('textarea');
-    if (textarea && textarea.value.trim()) {
-      return textarea.value;
-    }
-  }
-  // 否则使用稳定草稿源
-  if (currentResumeDraftMd.trim()) return currentResumeDraftMd;
-  return currentResume ? currentResume.content_md || '' : '';
-}
-
 function dispatchExport(format) {
   const contentMd = getCurrentResumeDraft();
   if (!contentMd.trim()) {
@@ -3333,6 +3408,7 @@ function bindDeliveryEvents(container) {
  */
 async function openSplitView(jobId) {
   currentSplitJobId = jobId;
+  document.body.classList.remove('ai-active');
   const wsContainer = document.querySelector('.ws');
   const splitEl = document.getElementById('splitView');
   if (wsContainer) wsContainer.style.display = 'none';
@@ -3351,6 +3427,7 @@ async function openSplitView(jobId) {
  */
 function closeSplitView() {
   currentSplitJobId = null;
+  document.body.classList.remove('ai-active');
   const wsContainer = document.querySelector('.ws');
   const splitEl = document.getElementById('splitView');
   if (splitEl) splitEl.classList.remove('on');
@@ -3447,6 +3524,7 @@ function loadSplitCenterResume() {
           <button data-format="docx">Word (.docx)</button>
         </div>
       </div>
+      <button class="toolbar-btn primary" id="sp-btn-ai-toggle">🤖 AI 优化</button>
     </div>
     <div id="sp-resume-view" class="resume-dual-mode__view"></div>
     <div id="sp-resume-edit" class="resume-dual-mode__edit" style="display:none"></div>
@@ -3640,6 +3718,17 @@ function bindSplitCenterEvents() {
       dispatchExport(format);
     });
   }
+
+  // AI优化 切换按钮
+  const aiToggleBtn = document.getElementById('sp-btn-ai-toggle');
+  if (aiToggleBtn) {
+    aiToggleBtn.addEventListener('click', () => {
+      document.body.classList.toggle('ai-active');
+      const isActive = document.body.classList.contains('ai-active');
+      aiToggleBtn.textContent = isActive ? '✕ 关闭 AI' : '🤖 AI 优化';
+      aiToggleBtn.classList.toggle('primary', !isActive);
+    });
+  }
 }
 
 /**
@@ -3694,7 +3783,6 @@ function loadSplitRightAssistant(jobId) {
             <span class="ai-dt-toggle-slider"></span>
           </label>
         </div>
-        <button class="res-btn res-btn--ai" id="sp-btn-run-deep-think" style="margin-top:8px; width:100%;">🧠 运行深度思考</button>
         <div class="ai-secondary-model-section" id="sp-secondary-model">
           <button class="ai-secondary-model-toggle" id="sp-sec-model-toggle" type="button">▶ 第二模型配置</button>
           <div class="ai-secondary-model-body" id="sp-sec-model-body" style="display:none">
@@ -3736,6 +3824,22 @@ function loadSplitRightAssistant(jobId) {
       </div>
     </div>
   `;
+
+  // 恢复历史消息
+  const savedMessages = loadAssistantSession(jobId);
+  if (savedMessages.length > 0) {
+    aiConversationHistory = savedMessages;
+    const msgContainer = document.getElementById('aiMessages');
+    if (msgContainer) {
+      for (const msg of savedMessages) {
+        if (msg.role === 'user') {
+          addAIUserMessage(msg.text);
+        } else if (msg.role === 'assistant') {
+          addAIResponseMessage(msg.text);
+        }
+      }
+    }
+  }
 
   // 绑定 AI 助手事件
   bindSplitRightAssistantEvents(jobId);
@@ -3854,6 +3958,7 @@ function bindSplitRightAssistantEvents(jobId) {
     addAIUserMessage(text);
     aiInput.value = '';
     aiConversationHistory.push({ role: 'user', text });
+    saveAssistantSession(jobId, aiConversationHistory);
 
     showAITyping();
     if (sendBtn) sendBtn.disabled = true;
@@ -3877,6 +3982,7 @@ function bindSplitRightAssistantEvents(jobId) {
       const reply = data.reply || data.message || data.response || '（无回复）';
       addAIResponseMessage(reply);
       aiConversationHistory.push({ role: 'assistant', text: reply });
+      saveAssistantSession(jobId, aiConversationHistory);
 
       // 处理 AI 修改简历的写回
       if (data.resume_updated && data.resume_updated_content_md) {
@@ -3884,23 +3990,7 @@ function bindSplitRightAssistantEvents(jobId) {
         if (currentResume) {
           currentResume.content_md = data.resume_updated_content_md;
         }
-        // 重新渲染中栏简历预览
-        const spView = document.getElementById('sp-resume-view');
-        if (spView) {
-          spView.innerHTML = renderResumePreviewShell(currentResumeDraftMd, currentResumeTemplate, { editable: false, viewMode: 'split' });
-          initializeResumePreviewShells(spView);
-        }
-        // 同步编辑区
-        const spEdit = document.getElementById('sp-resume-edit');
-        if (spEdit) {
-          const textarea = spEdit.querySelector('textarea');
-          if (textarea) textarea.value = currentResumeDraftMd;
-          const editPreview = spEdit.querySelector('.resume-edit-dual__preview');
-          if (editPreview) {
-            editPreview.innerHTML = renderResumePreviewShell(currentResumeDraftMd, currentResumeTemplate, { editable: true, viewMode: 'split' });
-            initializeResumePreviewShells(spEdit);
-          }
-        }
+        refreshAllResumeViews();
         // 保存到后端
         updateResumeContent(currentResumeDraftMd).catch(() => {});
         addAIResponseMessage('✅ 简历已根据 AI 建议更新，请查看中栏', '系统');
@@ -3939,6 +4029,7 @@ function bindSplitRightAssistantEvents(jobId) {
   if (clearChatBtn) {
     clearChatBtn.addEventListener('click', () => {
       aiConversationHistory = [];
+      clearAssistantSession(jobId);
       const aiMessages = document.getElementById('aiMessages');
       if (aiMessages) {
         aiMessages.innerHTML = `
@@ -4016,12 +4107,6 @@ function bindSplitRightAssistantEvents(jobId) {
         spDtToggle.checked = !spDtToggle.checked;
       }
     });
-  }
-
-  // 运行深度思考按钮
-  const runDtBtn = document.getElementById('sp-btn-run-deep-think');
-  if (runDtBtn) {
-    runDtBtn.addEventListener('click', () => handleDeepThink(runDtBtn, 'split'));
   }
 
   // 第二模型折叠 + 保存

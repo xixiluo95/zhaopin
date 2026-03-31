@@ -2457,31 +2457,54 @@ a {
     border: 2px solid var(--c-black);
 }
 
+/* 默认二栏布局 */
 .sp-l {
-    flex: 0 0 30%;
-    min-width: 280px;
+    width: 50%;
+    min-width: 350px;
     background: var(--c-paper);
     border-right: 3px solid var(--c-black);
+    transition: width 0.3s ease;
 }
 
 .sp-c {
-    flex: 0 0 40%;
-    min-width: 360px;
+    flex: 1;
+    min-width: 400px;
     background: var(--c-paper);
     border-right: 3px solid var(--c-black);
     padding: 0;
     display: flex;
     flex-direction: column;
+    transition: all 0.3s ease;
 }
 
 .sp-r {
-    flex: 0 0 30%;
-    min-width: 300px;
+    width: 0;
+    min-width: 0;
+    opacity: 0;
+    overflow: hidden;
     background: var(--c-paper);
     padding: 0;
     display: flex;
     flex-direction: column;
-    overflow: hidden;
+    transition: all 0.3s ease;
+    pointer-events: none;
+}
+
+/* AI激活三栏布局 */
+body.ai-active .sp-l { width: 30%; min-width: 300px; }
+body.ai-active .sp-c { width: 40%; min-width: 350px; flex: none; }
+body.ai-active .sp-r { width: 30%; min-width: 320px; opacity: 1; pointer-events: auto; }
+
+/* AI 切换按钮 */
+.toolbar-btn.primary,
+#sp-btn-ai-toggle.primary {
+    background: var(--c-red, #E62B1E);
+    color: #fff;
+    border-color: var(--c-red, #E62B1E);
+}
+
+#sp-btn-ai-toggle {
+    margin-left: auto;
 }
 
 .sp-c .res-bar {

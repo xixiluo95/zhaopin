@@ -358,9 +358,9 @@ function getAssistantToolGuide(toolName) {
       notes: ['仅当用户明确提出修改/优化简历时使用。']
     },
     read_project_skill: {
-      purpose: '读取项目根目录 SKILL.md，理解插件和爬虫入口。',
-      args: {},
-      notes: ['适合用户问爬虫能力、系统结构、插件工作流。']
+      purpose: '读取项目根目录 SKILL.md 或子目录中的技能文档。',
+      args: { skill_path: '可选，相对于 ai-bootstrap 目录的路径，如 skills/resume-script-editor/SKILL.md' },
+      notes: ['适合用户问爬虫能力、系统结构、插件工作流、简历编辑工具用法。']
     },
     fetch_url: {
       purpose: '抓取指定 URL 的网页文本。',
@@ -422,6 +422,12 @@ function getAssistantSystemMap() {
         label: '互联网入口',
         path: 'fetch_url / web_search',
         usage: '需要查公开网页或联网搜索时使用；先搜索，再按需抓取具体 URL。',
+      },
+      {
+        id: 'resume_editor_skill',
+        label: '简历编辑工具技能',
+        path: 'ai-bootstrap/skills/resume-script-editor/SKILL.md',
+        usage: '用 read_project_skill 读取简历脚本编辑工具的详细说明，了解如何精确操作简历内容和样式。',
       },
     ],
     principles: [
@@ -617,12 +623,25 @@ async function executeAssistantTool({ db, toolName, args, currentJobId, resume }
       };
     }
     case 'read_project_skill': {
-      if (!fs.existsSync(PROJECT_SKILL_FILE)) {
+      // 支持读取子目录中的 skill 文件
+      let skillPath = PROJECT_SKILL_FILE;
+      if (args?.skill_path) {
+        const resolved = path.resolve(AI_BOOTSTRAP_DIR, args.skill_path);
+        // 安全检查：只允许读取 ai-bootstrap 目录下的文件
+        if (resolved.startsWith(path.resolve(AI_BOOTSTRAP_DIR)) && fs.existsSync(resolved)) {
+          skillPath = resolved;
+        } else if (fs.existsSync(PROJECT_SKILL_FILE)) {
+          skillPath = PROJECT_SKILL_FILE;
+        } else {
+          throw new Error('技能文档不存在');
+        }
+      }
+      if (!fs.existsSync(skillPath)) {
         throw new Error('项目 SKILL.md 不存在');
       }
       return {
-        path: PROJECT_SKILL_FILE,
-        content: truncateText(fs.readFileSync(PROJECT_SKILL_FILE, 'utf8'), 8000),
+        path: skillPath,
+        content: truncateText(fs.readFileSync(skillPath, 'utf8'), 8000),
       };
     }
     case 'fetch_url': {
