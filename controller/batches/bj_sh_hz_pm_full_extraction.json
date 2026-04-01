@@ -1,0 +1,24 @@
+{
+  "batchId": "BATCH-20260322-BJ-SH-HZ-PM-FULL",
+  "deliveryTarget": "personal",
+  "tasks": [
+    {
+      "city": "北京",
+      "keyword": "产品经理",
+      "priority": "normal",
+      "source": "codex-bj-sh-hz-pm-full-extraction"
+    },
+    {
+      "city": "上海",
+      "keyword": "产品经理",
+      "priority": "normal",
+      "source": "codex-bj-sh-hz-pm-full-extraction"
+    },
+    {
+      "city": "杭州",
+      "keyword": "产品经理",
+      "priority": "normal",
+      "source": "codex-bj-sh-hz-pm-full-extraction"
+    }
+  ]
+}

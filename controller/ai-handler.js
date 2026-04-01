@@ -21,6 +21,10 @@ const { runDeepThink, resolveDeepThinkMode, validateDeepThinkConfig } = require(
 const AI_BOOTSTRAP_DIR = process.env.ZHAOPIN_AI_BOOTSTRAP_DIR
   || path.join(__dirname, '../crawler/extension/ai-bootstrap');
 
+const AI_MEMORY_WRITE_DIR = process.env.ZHAOPIN_AI_MEMORY_DIR
+  || path.join(__dirname, 'data', 'ai-memory');
+const AI_MEMORY_WRITE_FILE = path.join(AI_MEMORY_WRITE_DIR, 'memory.md');
+
 const AI_BOOTSTRAP_FILES = [
   {
     key: 'identity',
@@ -71,13 +75,31 @@ function readAIBootstrapContext() {
         continue;
       }
 
-      sections.push(`## ${item.label}\n文件: ${item.file}\n\n${content}`);
+      sections.push({ key: item.key, text: `## ${item.label}\n文件: ${item.file}\n\n${content}` });
     } catch (err) {
       console.warn(`[AIBootstrap] 读取失败: ${item.file}`, err.message);
     }
   }
 
-  return sections.join('\n\n');
+  // Prefer updated memory from data dir over extension's 03-memory.md
+  try {
+    if (fs.existsSync(AI_MEMORY_WRITE_FILE)) {
+      const updatedMemory = fs.readFileSync(AI_MEMORY_WRITE_FILE, 'utf8').trim();
+      if (updatedMemory) {
+        const idx = sections.findIndex((s) => s.key === 'memory');
+        const replacement = `## 长期记忆\n文件: ${AI_MEMORY_WRITE_FILE}\n\n${updatedMemory}`;
+        if (idx >= 0) {
+          sections[idx] = { key: 'memory', text: replacement };
+        } else {
+          sections.push({ key: 'memory', text: replacement });
+        }
+      }
+    }
+  } catch (e) {
+    // Ignore - use bootstrap memory as fallback
+  }
+
+  return sections.map((s) => s.text).join('\n\n');
 }
 
 function detectResumeMimeType(filePath) {
@@ -226,10 +248,7 @@ function buildMemoryUpdateResult(parsed) {
     return { updated: false };
   }
 
-  const memoryFile = AI_BOOTSTRAP_FILES.find((item) => item.key === 'memory')?.file;
-  if (!memoryFile) {
-    return { updated: false };
-  }
+  const memoryFile = AI_MEMORY_WRITE_FILE;
 
   try {
     ensureFileDir(memoryFile);
@@ -457,10 +476,46 @@ function buildAssistantSystemPrompt({ bootstrapContext, currentJobId }) {
     '当需要工具时，输出：{"action":"tool_call","tool":"工具名","arguments":{...},"reason":"为什么需要这个工具"}',
     '当准备回复用户时，输出：{"action":"respond","reply":"给用户看的回复","suggestions":["可选建议"],"resume_updated":true/false,"resume_updated_content_md":"若本轮改了简历则返回最新完整 Markdown，否则空字符串","memory_update":{"should_update":true/false,"reason":"为什么更新长期记忆","content_md":"完整长期记忆 Markdown 或空字符串"}}',
     '如果你已经通过 update_resume 修改了简历，最终 respond 时必须把 resume_updated 设为 true。',
+    `## 硬性约束
+1. 【最小修改原则】只修改用户明确要求的部分，不主动修改其他内容
+2. 【格式保持】保持原有Markdown格式和结构不变
+3. 【头部保护】永远不修改简历的header/联系方式部分，除非用户明确要求
+4. 【两阶段执行】
+   - 分析阶段：理解用户意图，确认修改范围
+   - 执行阶段：只在确认范围内进行修改
+5. 【输出格式】
+   - 回复用自然语言，简洁友好
+   - 如需展示修改内容，用代码块包裹
+   - 不要在回复中暴露内部处理逻辑或JSON格式`,
     '工具摘要：',
     toolCatalog,
     bootstrapContext,
   ].filter(Boolean).join('\n\n');
+}
+
+// Sanitize reply - never expose raw JSON protocol to user
+function sanitizeReply(reply) {
+  if (!reply || typeof reply !== 'string') return reply || '（无回复）';
+
+  const trimmed = reply.trim();
+  if (trimmed.startsWith('{') && trimmed.includes('"action"')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed.reply) return parsed.reply;
+      if (parsed.action === 'respond' && parsed.content) return parsed.content;
+      return '（AI处理中出现异常，请重试）';
+    } catch (e) {
+      // Not valid JSON, might be partial - strip protocol-looking parts
+    }
+  }
+
+  // Strip any accidental JSON wrapper
+  const jsonMatch = trimmed.match(/\{[\s\S]*"reply"\s*:\s*"([\s\S]*?)"[\s\S]*\}/);
+  if (jsonMatch && jsonMatch[1]) {
+    return jsonMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+  }
+
+  return reply;
 }
 
 function sanitizeSqlQuery(sql) {
@@ -1112,7 +1167,7 @@ async function handleAssistantChat(req, res) {
 
       res.end(JSON.stringify({
         success: true,
-        reply: assistantResult.reply,
+        reply: sanitizeReply(assistantResult.reply),
         suggestions: assistantResult.suggestions,
         resume_updated: assistantResult.resume_updated,
         resume_updated_content_md: assistantResult.resume_updated_content_md,

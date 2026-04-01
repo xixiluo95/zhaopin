@@ -1,0 +1,117 @@
+{
+  "trace_id": "dt-1774972937720-dtmg",
+  "created_at": "2026-03-31T16:10:38.582Z",
+  "duration_ms": 500862,
+  "mode": "single",
+  "rounds": 3,
+  "stop_reason": "critic_suggests_stop",
+  "conclusions_count": 4,
+  "logs": [
+    {
+      "timestamp": "2026-03-31T16:02:17.721Z",
+      "elapsed_ms": 1,
+      "level": "info",
+      "category": "init",
+      "message": "运行模式: single",
+      "data": {
+        "fallbackUsed": false,
+        "reason": "auto 模式未检测到第二模型，使用 single"
+      }
+    },
+    {
+      "timestamp": "2026-03-31T16:02:17.721Z",
+      "elapsed_ms": 1,
+      "level": "info",
+      "category": "init",
+      "message": "深度思考开始",
+      "data": {
+        "task": "你好",
+        "mode": "single",
+        "maxRounds": 10
+      }
+    },
+    {
+      "timestamp": "2026-03-31T16:02:17.722Z",
+      "elapsed_ms": 2,
+      "level": "info",
+      "category": "round",
+      "message": "第 1 轮开始",
+      "data": {
+        "round": 1,
+        "mode": "single"
+      }
+    },
+    {
+      "timestamp": "2026-03-31T16:05:00.222Z",
+      "elapsed_ms": 162502,
+      "level": "info",
+      "category": "round",
+      "message": "第 1 轮结束",
+      "data": {
+        "round": 1,
+        "newFacts": 5,
+        "newConclusions": 1,
+        "criticSuggestsStop": false
+      }
+    },
+    {
+      "timestamp": "2026-03-31T16:05:00.222Z",
+      "elapsed_ms": 162502,
+      "level": "info",
+      "category": "round",
+      "message": "第 2 轮开始",
+      "data": {
+        "round": 2,
+        "mode": "single"
+      }
+    },
+    {
+      "timestamp": "2026-03-31T16:07:17.295Z",
+      "elapsed_ms": 299575,
+      "level": "info",
+      "category": "round",
+      "message": "第 2 轮结束",
+      "data": {
+        "round": 2,
+        "newFacts": 3,
+        "newConclusions": 2,
+        "criticSuggestsStop": false
+      }
+    },
+    {
+      "timestamp": "2026-03-31T16:07:17.295Z",
+      "elapsed_ms": 299575,
+      "level": "info",
+      "category": "round",
+      "message": "第 3 轮开始",
+      "data": {
+        "round": 3,
+        "mode": "single"
+      }
+    },
+    {
+      "timestamp": "2026-03-31T16:09:29.786Z",
+      "elapsed_ms": 432066,
+      "level": "info",
+      "category": "round",
+      "message": "第 3 轮结束",
+      "data": {
+        "round": 3,
+        "newFacts": 2,
+        "newConclusions": 1,
+        "criticSuggestsStop": true
+      }
+    },
+    {
+      "timestamp": "2026-03-31T16:09:29.787Z",
+      "elapsed_ms": 432067,
+      "level": "info",
+      "category": "stop",
+      "message": "深度思考停止: critic_suggests_stop",
+      "data": {
+        "reason": "critic_suggests_stop",
+        "round": 3
+      }
+    }
+  ]
+}

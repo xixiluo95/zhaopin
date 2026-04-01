@@ -1,0 +1,12 @@
+{
+  "batchId": "BATCH-20260322-SHENZHEN-PM-FULL",
+  "deliveryTarget": "personal",
+  "tasks": [
+    {
+      "city": "深圳",
+      "keyword": "产品经理",
+      "priority": "normal",
+      "source": "codex-shenzhen-pm-full-extraction"
+    }
+  ]
+}

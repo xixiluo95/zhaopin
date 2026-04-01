@@ -1646,6 +1646,7 @@ function renderResumeDualMode(contentMd, viewMode = 'default') {
         <button class="res-btn res-btn--g" id="${idPrefix}-btn-edit" data-mode="edit" data-view="${viewMode}">编辑</button>
         <button class="res-btn res-btn--g" id="${idPrefix}-btn-save" data-view="${viewMode}">保存</button>
         ${renderResumeTemplateSelector(viewMode)}
+        <button class="res-btn btn-outline" id="${idPrefix}-btn-upload" title="上传简历文件(.md/.txt/.json)">上传简历</button>
         <div class="export-dropdown" id="${idPrefix}-export-dropdown">
           <button class="res-btn res-btn--export btn-export" id="${idPrefix}-btn-export-resume"
                   ${!currentResume ? 'disabled title="请先上传简历"' : ''}>
@@ -3190,6 +3191,7 @@ function bindResumeDualModeEvents(container, viewMode = 'default') {
 
     // 导出按钮由 bindExportDropdownEvents 处理，此处跳过
     if (btn.id.includes('btn-export-resume')) return;
+    if (btn.id.includes('btn-upload')) { triggerFileInput(); return; }
 
     const mode = btn.dataset.mode;
     const view = btn.dataset.view;
@@ -3802,16 +3804,18 @@ function loadSplitRightAssistant(jobId) {
       <div class="ai-panel-main">
         <div class="ai-messages" id="aiMessages">
           <div class="message ai">
-            <div class="message-avatar">🤖</div>
+            <div class="message-avatar ai-avatar">🤖</div>
             <div class="message-body">
-              <div class="message-content">
-                <div class="message-sender">AI 助手</div>
-                <div class="structured-content">
+              <div class="message-meta">
+                <span class="message-sender">AI 助手</span>
+                <span class="message-time">${getAIChatTime()}</span>
+              </div>
+              <div class="message-bubble">
+                <div class="message-text">
                   你好！我是你的简历优化助手。<br>
                   你可以发送消息让我帮你优化简历、分析岗位匹配度，或者直接提问。
                 </div>
               </div>
-              <div class="message-time">${getAIChatTime()}</div>
             </div>
           </div>
           <div class="typing-indicator" id="typingIndicator" style="display: none;">
@@ -3882,14 +3886,16 @@ function addAIUserMessage(text) {
   const messageDiv = document.createElement('div');
   messageDiv.className = 'message user';
   messageDiv.innerHTML = `
-    <div class="message-avatar">👤</div>
     <div class="message-body">
-      <div class="message-content">
-        <div class="message-sender">你</div>
-        ${escapeHtml(text)}
+      <div class="message-meta">
+        <span class="message-sender">你</span>
+        <span class="message-time">${getAIChatTime()}</span>
       </div>
-      <div class="message-time">${getAIChatTime()}</div>
+      <div class="message-bubble">
+        <div class="message-text">${escapeHtml(text)}</div>
+      </div>
     </div>
+    <div class="message-avatar user-avatar">👤</div>
   `;
 
   if (typingIndicator) {
@@ -3908,13 +3914,15 @@ function addAIResponseMessage(text, sender = 'AI 助手') {
   const messageDiv = document.createElement('div');
   messageDiv.className = 'message ai';
   messageDiv.innerHTML = `
-    <div class="message-avatar">🤖</div>
+    <div class="message-avatar ai-avatar">🤖</div>
     <div class="message-body">
-      <div class="message-content">
-        <div class="message-sender">${escapeHtml(sender)}</div>
-        <div class="structured-content">${text.replace(/\n/g, '<br>')}</div>
+      <div class="message-meta">
+        <span class="message-sender">${escapeHtml(sender)}</span>
+        <span class="message-time">${getAIChatTime()}</span>
       </div>
-      <div class="message-time">${getAIChatTime()}</div>
+      <div class="message-bubble">
+        <div class="message-text">${text.replace(/\n/g, '<br>')}</div>
+      </div>
     </div>
   `;
 
@@ -4158,16 +4166,32 @@ function shouldTriggerDeepThink(text, context) {
         data = await chatWithAIAssistant(jobId, text, aiConversationHistory);
       }
       hideAITyping();
-      const reply = data.reply || data.message || data.response || '（无回复）';
+
+      // Sanitize: strip any leaked JSON protocol
+      let displayReply = data.reply || data.message || data.response || '（无回复）';
+      if (typeof displayReply === 'string' && displayReply.trim().startsWith('{')) {
+        try {
+          const leaked = JSON.parse(displayReply.trim());
+          if (leaked.reply) displayReply = leaked.reply;
+          else if (leaked.action && leaked.content) displayReply = leaked.content;
+        } catch (e) { /* not JSON, use as-is */ }
+      }
+      // Never expose internal fields to the UI
+      const resumeContentMd = data.resume_updated_content_md;
+      delete data.memory_update_reason;
+      delete data.tool_trace;
+      delete data.resume_updated_content_md;
+
+      const reply = displayReply;
       addAIResponseMessage(reply);
       aiConversationHistory.push({ role: 'assistant', text: reply });
       saveAssistantSession(jobId, aiConversationHistory);
 
       // 处理 AI 修改简历的写回
-      if (data.resume_updated && data.resume_updated_content_md) {
-        currentResumeDraftMd = data.resume_updated_content_md;
+      if (data.resume_updated && resumeContentMd) {
+        currentResumeDraftMd = resumeContentMd;
         if (currentResume) {
-          currentResume.content_md = data.resume_updated_content_md;
+          currentResume.content_md = resumeContentMd;
         }
         refreshAllResumeViews();
         // 保存到后端
@@ -4213,13 +4237,15 @@ function shouldTriggerDeepThink(text, context) {
       if (aiMessages) {
         aiMessages.innerHTML = `
           <div class="message ai">
-            <div class="message-avatar">🤖</div>
+            <div class="message-avatar ai-avatar">🤖</div>
             <div class="message-body">
-              <div class="message-content">
-                <div class="message-sender">AI 助手</div>
-                <div class="structured-content">对话已清空。有什么可以帮你的吗？</div>
+              <div class="message-meta">
+                <span class="message-sender">AI 助手</span>
+                <span class="message-time">${getAIChatTime()}</span>
               </div>
-              <div class="message-time">${getAIChatTime()}</div>
+              <div class="message-bubble">
+                <div class="message-text">对话已清空。有什么可以帮你的吗？</div>
+              </div>
             </div>
           </div>
           <div class="typing-indicator" id="typingIndicator" style="display: none;">
