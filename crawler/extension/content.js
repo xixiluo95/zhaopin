@@ -64,7 +64,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 // 搜索职位
-async function scrapeJobs(keyword, cityCode, pageSize = 3, experience = '', page = 1) {
+async function scrapeJobs(keyword, cityCode, pageSize = 15, experience = '', page = 1) {
   if (isSecurityCheckPage()) {
     return buildSecurityCheckResponse();
   }
@@ -123,7 +123,12 @@ async function scrapeJobs(keyword, cityCode, pageSize = 3, experience = '', page
     }
 
     const jobList = data.zpData?.jobList || [];
-    log(`Found ${jobList.length} jobs`);
+    // V2: 提取分页元信息（totalCount / hasMore）
+    const apiTotalCount = typeof data.zpData?.totalCount === 'number' ? data.zpData.totalCount : null;
+    const apiHasMore = typeof data.zpData?.hasMore === 'boolean'
+      ? data.zpData.hasMore
+      : (jobList.length >= pageSize);
+    log(`Found ${jobList.length} jobs, totalCount=${apiTotalCount}, hasMore=${apiHasMore}`);
 
     const domLinkMap = buildBossDomLinkMap();
     console.log(
@@ -161,8 +166,12 @@ async function scrapeJobs(keyword, cityCode, pageSize = 3, experience = '', page
     return {
       success: true,
       data: jobs,
-      total: jobs.length,
-      page
+      page,
+      pageSize: Number(pageSize),
+      batchCount: jobs.length,
+      totalCount: apiTotalCount,
+      hasMore: apiHasMore,
+      source: 'api'
     };
 
   } catch (error) {

@@ -38,10 +38,47 @@ const CONFIG = {
     '机器人产品经理',
     '大模型产品经理'
   ],
-  // Boss 批量采集策略（分批 3 条、持续翻完）
-  BOSS_BATCH_SIZE: 3,              // 每次列表请求固定 pageSize = 3
+  // Boss 采集策略 V2（缓冲模式：大页列表 + 批量详情 + 策略轮转）
+  BOSS_DETAIL_BATCH_SIZE: 3,       // 详情处理批次大小（每批3条）
   BOSS_RUN_UNTIL_EXHAUSTED: true,  // 持续翻页直到无新结果
-  MAX_LIST_PAGES_PER_RUN: 0,       // 0 = 不限页数，配合 BOSS_RUN_UNTIL_EXHAUSTED
+  MAX_LIST_PAGES_PER_RUN: 0,       // 0 = 不限页数
+  BOSS_MAX_API_PAGES: 10,          // Boss API 最大有效页数（平台限制）
+  // 多策略轮转：按顺序尝试，遇到反爬自动切换下一策略
+  BOSS_STRATEGIES: [
+    {
+      id: 'buffer-large',
+      name: '缓冲大页(30)',
+      description: '列表接口每页30条，减少列表请求次数，详情批量3条处理',
+      listPageSize: 30,
+      listDelayMs: 12000,
+      detailDelayMs: 8000,
+      detailBatchSize: 3,
+      maxPages: 10,
+      interleaved: true,
+    },
+    {
+      id: 'buffer-medium',
+      name: '缓冲中页(15)',
+      description: '列表接口每页15条，中等请求频率',
+      listPageSize: 15,
+      listDelayMs: 10000,
+      detailDelayMs: 8000,
+      detailBatchSize: 3,
+      maxPages: 10,
+      interleaved: true,
+    },
+    {
+      id: 'sequential-conservative',
+      name: '顺序保守(15)',
+      description: '列表全获取后统一处理详情，最保守',
+      listPageSize: 15,
+      listDelayMs: 15000,
+      detailDelayMs: 10000,
+      detailBatchSize: 3,
+      maxPages: 5,
+      interleaved: false,
+    },
+  ],
   
   // 经验要求代码：101=应届生, 102=1-3年, 103=3-5年, 104=5-10年, 105=10年以上
   EXPERIENCE: '102',  // 默认1-3年
@@ -106,7 +143,7 @@ const RUNTIME_CONFIG_DEFAULTS = {
   EXPERIENCE: '',
   JOB_FILTER_MODE: CONFIG.JOB_FILTER_MODE,
   MAX_LIST_PAGES_PER_RUN: 0,        // 0 = unlimited（配合 BOSS_RUN_UNTIL_EXHAUSTED）
-  MAX_LIST_PAGE_SIZE: CONFIG.BOSS_BATCH_SIZE,  // 使用 BOSS_BATCH_SIZE
+  MAX_LIST_PAGE_SIZE: 30,  // 统一为30（与controller DEFAULT_RUNTIME_CONFIG一致）
   MAX_DETAIL_REQUESTS_PER_RUN: 0,   // 0 = unlimited
   EXP_HARD_EXCLUDE_SOURCE: '',
   deliveryEnabled: false,
@@ -509,7 +546,7 @@ class JobHunterService {
     });
     
     console.log(
-      `[JobHunter] Service initialized | CODE_VERSION=${CODE_VERSION} | PIPELINE_VERSION=${PIPELINE_VERSION} | JOB_FILTER_MODE=${this.getJobFilterMode()} | BOSS_BATCH_SIZE=${CONFIG.BOSS_BATCH_SIZE} | BOSS_RUN_UNTIL_EXHAUSTED=${CONFIG.BOSS_RUN_UNTIL_EXHAUSTED} | MAX_LIST_PAGES_PER_RUN=${this.getMaxListPagesPerRun()} | MAX_LIST_PAGE_SIZE=${this.getMaxListPageSize()}`
+      `[JobHunter] Service initialized | CODE_VERSION=${CODE_VERSION} | PIPELINE_VERSION=${PIPELINE_VERSION} | JOB_FILTER_MODE=${this.getJobFilterMode()} | STRATEGY_V2=true | STRATEGIES=${CONFIG.BOSS_STRATEGIES.map(s=>s.id).join(',')} | DETAIL_BATCH=${CONFIG.BOSS_DETAIL_BATCH_SIZE} | MAX_LIST_PAGE_SIZE=${this.getMaxListPageSize()}`
     );
   }
 
@@ -1066,112 +1103,54 @@ class JobHunterService {
       console.log('[JobHunter] Waiting for Content Script...');
       await this.waitForContentScript(tab.id);
 
-      // 6. 执行搜索
-      console.log(`[JobHunter] Searching: ${keyword} in ${city.name}`);
+      // 6. 执行缓冲模式采集 V2（大页列表 + 批量详情 + 策略轮转）
+      console.log(`[JobHunter] Searching: ${keyword} in ${city.name} (V2 buffer mode)`);
+      const seenJobIds = isManualTask ? new Set() : await this.getSeenJobIdsSet();
       
-      const searchResult = await this.scrapeJobListPages(tab.id, {
+      const crawlResult = await this.executeBufferedBossCrawl(tab.id, {
         keyword,
         cityCode: city.code,
-        pageSize: CONFIG.BOSS_BATCH_SIZE,
         experience: this.getExperienceCode(),
-        maxPagesOverride: CONFIG.BOSS_RUN_UNTIL_EXHAUSTED ? 0 : null
-      });
-
-      // 反爬检测
-      if (!searchResult.success) {
-        this.consecutiveFailures++;
-        const isAntiCrawl = this.isAntiCrawlError(searchResult.error);
-        
-        console.log(`[JobHunter] ⚠️ Search failed (${this.consecutiveFailures} consecutive)`);
-        console.log(`[JobHunter] Error: ${searchResult.error}`);
-        console.log(`[JobHunter] Anti-crawl detected: ${isAntiCrawl}`);
-
-        if (isAntiCrawl || this.consecutiveFailures >= CONFIG.ANTI_CRAWL.MAX_CONSECUTIVE_FAILURES) {
-          // 触发状态机升级
-          await this.transitionCrawlState('anti_crawl');
-          antiCrawlTriggered = true;
-          // 只有内置队列任务才放回 pending_queue，控制面任务由控制面管理重试
-          if (!fromController) {
-            await this.putBackTask(task);
-          } else {
-            console.log(`[JobHunter] Controller task anti-crawl, not putting back to internal queue`);
-          }
-        }
-        
-        if (isManualTask) {
-          keepManualTabOpen = true;
-          try {
-            await chrome.tabs.update(tab.id, { active: true });
-          } catch {}
-          console.warn('[JobHunter] Manual task requires in-page intervention, keeping tab open');
-        }
-
-        throw new Error(`Search failed: ${searchResult.error}`);
-      }
-
-      // 搜索成功
-      if (this.consecutiveFailures > 0) {
-        console.log(`[JobHunter] ✅ Search success, resetting failure count`);
-        this.consecutiveFailures = 0;
-      }
-      await this.transitionCrawlState('success');
-      this.runStats.listCount = searchResult.data.length;
-      this.runStats.pagedListCount = searchResult.data.length;
-      this.runStats.pagesFetched = searchResult.pagesFetched || 0;
-
-      if (!searchResult.data || searchResult.data.length === 0) {
-        console.log(`[JobHunter] No jobs found for ${keyword} in ${city.name}`);
-        this.isRunning = false;
-        await this.saveStats();
-        // 向控制面报告结果（P0修复：提前返回也要上报）
-        const result = this.buildTaskResult({
-          city,
-          keyword,
-          taskId,
-          status: 'success',
-          total: 0,
-          pushed: 0,
-          filtered: 0,
-          errorCode: null,
-          errorMessage: null
-        });
-        await this.reportToController(result);
-        if (fromController && CONFIG.TASK_SOURCE_MODE === 'controller_only') {
-          await this.enterIdlePolling('controller_task_finished');
-        }
-        return { success: true, total: 0, reason: 'no_jobs' };
-      }
-
-      // 规则过滤
-      console.log(`[JobHunter] Search returned ${searchResult.data.length} jobs:`,
-        searchResult.data.map(j => `${j.jobName}[${j.jobExperience || '经验未知'}]`));
-      
-      const { kept, filtered, filterReasonStats } = this.filterJobs(searchResult.data, {
+        isManualTask,
+        seenJobIds,
+        deliveryBatchId,
+        city,
         manualKeyword: isManualTask ? keyword : ''
       });
-      if (filtered.length > 0) {
-        console.log(`[JobHunter] Filtered ${filtered.length}/${searchResult.data.length} jobs:`,
-          filtered.map(j => `${j.jobName}(${j._filterReason})`));
-        console.log(`[JobHunter] Filter reason breakdown:`);
-        for (const [reason, jobNames] of Object.entries(filterReasonStats)) {
-          console.log(`  [${jobNames.length}] ${reason}: ${jobNames.join(', ')}`);
+
+      // 合并结果到外部变量
+      allJobs.push(...crawlResult.allJobs);
+      filteredJobs.push(...crawlResult.filteredJobs);
+      if (crawlResult.antiCrawlTriggered) {
+        antiCrawlTriggered = true;
+        await this.transitionCrawlState('anti_crawl');
+        if (!fromController) {
+          await this.putBackTask(task);
         }
-        this.runStats.filterReasonStats = filterReasonStats;
-        this.runStats.filteredCount += filtered.length;
-        filteredJobs.push(...filtered.map(j => ({
-          ...j, city: city.name, keyword, collectedAt: new Date().toISOString()
-        })));
+      }
+      incrementalInsertedCount = crawlResult.incrementalInsertedCount;
+
+      // 更新 runStats
+      this.runStats.listCount = crawlResult.totalListed;
+      this.runStats.pagedListCount = crawlResult.totalListed;
+      this.runStats.pagesFetched = crawlResult.strategyReport.reduce((sum, r) => sum + r.pagesSuccess, 0);
+      this.runStats.totalJobs += crawlResult.allJobs.length;
+
+      // 搜索成功状态
+      if (crawlResult.allJobs.length > 0 && !antiCrawlTriggered) {
+        if (this.consecutiveFailures > 0) {
+          console.log(`[JobHunter] ✅ Crawl success, resetting failure count`);
+          this.consecutiveFailures = 0;
+        }
+        await this.transitionCrawlState('success');
       }
 
-      if (kept.length === 0) {
-        console.log(`[JobHunter] All ${searchResult.data.length} jobs filtered`);
+      if (crawlResult.allJobs.length === 0 && !antiCrawlTriggered) {
+        console.log(`[JobHunter] No jobs collected for ${keyword} in ${city.name}`);
         this.isRunning = false;
         await this.saveStats();
-        // 向控制面报告结果（P0修复：提前返回也要上报）
         const result = this.buildTaskResult({
-          city,
-          keyword,
-          taskId,
+          city, keyword, taskId,
           status: 'success',
           total: 0,
           pushed: 0,
@@ -1183,160 +1162,18 @@ class JobHunterService {
         if (fromController && CONFIG.TASK_SOURCE_MODE === 'controller_only') {
           await this.enterIdlePolling('controller_task_finished');
         }
-        return { success: true, total: 0, filtered: filteredJobs.length, reason: 'all_filtered' };
+        return { success: true, total: 0, filtered: filteredJobs.length, reason: 'no_jobs' };
       }
 
-      console.log(`[JobHunter] Found ${kept.length} jobs (from ${searchResult.data.length}, filtered ${filtered.length})`);
-
-      const seenJobIds = isManualTask ? new Set() : await this.getSeenJobIdsSet();
-      const detailCandidates = this.selectDetailCandidates(kept, seenJobIds);
-
-      if (detailCandidates.length === 0) {
-        console.log(`[JobHunter] No new jobs eligible for detail harvesting (missingEncryptJobId=${this.runStats.missingEncryptJobIdCount}, seenSkipped=${this.runStats.detailSkippedSeenCount})`);
-        if (isManualTask && kept.length > 0) {
-          const manualJobs = kept.map((job) => ({
-            ...job,
-            city: city.name,
-            keyword,
-            collectedAt: new Date().toISOString(),
-            description: job.description || ''
-          }));
-          allJobs.push(...manualJobs);
-          this.runStats.totalJobs += manualJobs.length;
-          console.log(`[JobHunter] Manual task fallback: inserting ${manualJobs.length} list jobs without details`);
-        } else {
-          this.isRunning = false;
-          await this.saveStats();
-          const result = this.buildTaskResult({
-            city,
-            keyword,
-            taskId,
-            status: 'success',
-            total: 0,
-            pushed: 0,
-            filtered: filteredJobs.length,
-            errorCode: null,
-            errorMessage: null
-          });
-          await this.reportToController(result);
-          if (fromController && CONFIG.TASK_SOURCE_MODE === 'controller_only') {
-            await this.enterIdlePolling('controller_task_finished');
-          }
-          return { success: true, total: 0, filtered: filteredJobs.length, reason: 'no_new_jobs' };
-        }
+      // 反爬触发时保持手动标签页打开
+      if (antiCrawlTriggered && isManualTask) {
+        keepManualTabOpen = true;
+        try { await chrome.tabs.update(tab.id, { active: true }); } catch {}
+        console.warn('[JobHunter] Manual task anti-crawl, keeping tab open');
       }
-
-      // 搜索后延迟：批量模式使用较短延迟
-      if (!this.isRunning) {
-        console.log(`[JobHunter] Stopped by user before search cooldown, saving partial results`);
-      } else {
-        const searchCooldown = this.currentDelay + Math.random() * 2000;
-        console.log(`[JobHunter] ⏱️ Cooling down ${(searchCooldown/1000).toFixed(1)}s after search (source: ${this.crawlState.source})...`);
-        await this.sleep(searchCooldown);
-      }
-
-      // 7. 获取详情（先去重，再应用预算）
-      const detailBudget = this.getMaxDetailRequestsPerRun();
-      const maxDetails = detailBudget === 0
-        ? detailCandidates.length
-        : Math.min(detailCandidates.length, detailBudget);
-      console.log(`[JobHunter] Fetching details for ${maxDetails}/${detailCandidates.length} new jobs (MAX_DETAIL_REQUESTS_PER_RUN=${detailBudget === 0 ? 'unlimited' : detailBudget})`);
-      
-      const jobsWithDetails = [];
-      for (let i = 0; i < maxDetails; i++) {
-        if (!this.isRunning) {
-          console.log(`[JobHunter] Detail loop stopped by user at [${i}/${maxDetails}]`);
-          break;
-        }
-        const job = detailCandidates[i];
-        console.log(`[JobHunter] [${i+1}/${maxDetails}] Getting detail: ${job.jobName}`);
-        
-        try {
-          this.runStats.detailRequestedCount++;
-          const detailResult = await this.fetchJobDetailWithRetry(tab.id, job, 2);
-
-          if (detailResult.success && detailResult.data) {
-            this.runStats.detailSuccessCount++;
-            if (detailResult.data._source === 'card') {
-              this.runStats.cardApiUsed++;
-            } else {
-              this.runStats.detailApiUsed++;
-            }
-            if (detailResult.data.description?.length > 0) {
-              this.runStats.successWithDesc++;
-              this.runStats.detailDescriptionNonEmptyCount++;
-            }
-            const hydratedJob = {
-              ...job,
-              description: detailResult.data.description || '',
-              hardRequirements: detailResult.data.hardRequirements || '',
-              skills: detailResult.data.skills || job.skills || [],
-              address: detailResult.data.address || '',
-              welfareList: detailResult.data.welfareList || [],
-              bossName: detailResult.data.bossName || job.bossName || '',
-              bossTitle: detailResult.data.bossTitle || job.bossTitle || '',
-              _source: detailResult.data._source || 'none'
-            };
-            jobsWithDetails.push(hydratedJob);
-            await this.markJobIdSeen(job.encryptJobId, seenJobIds);
-            console.log(`[JobHunter]   ✓ Description: ${detailResult.data.description?.length || 0} chars`);
-
-            if (isManualTask) {
-              const jobWithMeta = {
-                ...hydratedJob,
-                city: city.name,
-                keyword,
-                collectedAt: new Date().toISOString()
-              };
-              const insertResult = await this.reportJobsToController(
-                [this.normalizeBossJobForBatchInsert(jobWithMeta, deliveryBatchId)],
-                'boss'
-              );
-              incrementalInsertedCount += (insertResult.inserted || 0) + (insertResult.duplicates || 0);
-            }
-          } else {
-            this.runStats.failCount++;
-            console.log(`[JobHunter]   ✗ Failed: ${detailResult.error || 'Unknown'}`);
-            
-            if (this.isAntiCrawlError(detailResult.error)) {
-              console.log(`[JobHunter]   ⚠️ Anti-crawl in detail API`);
-              await this.increaseDelay();
-              // 触发状态机
-              await this.transitionCrawlState('anti_crawl');
-              antiCrawlTriggered = true;
-            }
-            
-            jobsWithDetails.push({ ...job, description: '' });
-          }
-
-          if (i < maxDetails - 1) {
-            if (!this.isRunning) {
-              console.log(`[JobHunter] Detail loop stopped by user before detail sleep at [${i+1}/${maxDetails}]`);
-              break;
-            }
-            const detailDelay = this.currentDelay + Math.random() * 3000;
-            console.log(`[JobHunter]   ⏱️ Waiting ${(detailDelay/1000).toFixed(1)}s...`);
-            await this.sleep(detailDelay);
-          }
-        } catch (detailError) {
-          console.error(`[JobHunter] Detail error:`, detailError);
-          jobsWithDetails.push({ ...job, description: '' });
-        }
-      }
-
-      // 添加元数据
-      const jobsWithMeta = jobsWithDetails.map(job => ({
-        ...job,
-        city: city.name,
-        keyword: keyword,
-        collectedAt: new Date().toISOString()
-      }));
-      
-      allJobs.push(...jobsWithMeta);
-      this.runStats.totalJobs += jobsWithMeta.length;
 
       console.log(`[JobHunter] ========================================`);
-      console.log(`[JobHunter] Task completed: ${jobsWithMeta.length} jobs collected`);
+      console.log(`[JobHunter] Task completed: ${crawlResult.allJobs.length} jobs collected${crawlResult.totalCount ? ` / ${crawlResult.totalCount} available` : ''}`);
 
     } catch (error) {
       console.error('[JobHunter] Task error:', error);
@@ -2162,6 +1999,7 @@ class JobHunterService {
     const seenListJobKeys = new Set();
     let lastError = null;
     let pagesFetched = 0;
+    let totalCount = null;
 
     const maxPagesPerRun = Number.isInteger(maxPagesOverride)
       ? maxPagesOverride
@@ -2217,7 +2055,11 @@ class JobHunterService {
 
       const pageJobs = Array.isArray(pageResult.data) ? pageResult.data : [];
       pagesFetched += 1;
-      console.log(`[JobHunter] List page ${page} returned ${pageJobs.length} jobs`);
+      // V2: 提取 totalCount（仅首页）
+      if (page === 1 && pageResult.totalCount != null) {
+        totalCount = pageResult.totalCount;
+      }
+      console.log(`[JobHunter] List page ${page} returned ${pageJobs.length} jobs (totalCount=${pageResult.totalCount ?? 'N/A'})`);
 
       for (const job of pageJobs) {
         const dedupeKey = job.encryptJobId || job.securityId || `${job.jobName}::${job.brandName}::${job.salaryDesc}`;
@@ -2252,10 +2094,402 @@ class JobHunterService {
       success: true,
       data: mergedJobs,
       total: mergedJobs.length,
+      totalCount,
       pagesFetched,
       partial: Boolean(lastError),
       partialReason: lastError
     };
+  }
+
+  // ============ V2: 缓冲模式采集（大页列表 + 批量详情 + 策略轮转） ============
+  async executeBufferedBossCrawl(tabId, { keyword, cityCode, experience, isManualTask, seenJobIds, deliveryBatchId, city, manualKeyword }) {
+    const strategies = CONFIG.BOSS_STRATEGIES;
+    const allJobs = [];
+    const filteredJobs = [];
+    const strategyReport = [];
+    let antiCrawlTriggered = false;
+    let totalCount = null;
+    let incrementalInsertedCount = 0;
+    let totalListed = 0;
+
+    console.log(`[JobHunter] 📋 V2 Buffer Crawl: ${strategies.length} strategies available`);
+    for (const s of strategies) {
+      console.log(`[JobHunter]   [${s.id}] ${s.name}: pageSize=${s.listPageSize}, listDelay=${s.listDelayMs}ms, detailDelay=${s.detailDelayMs}ms, interleaved=${s.interleaved}`);
+    }
+
+    for (let si = 0; si < strategies.length; si++) {
+      if (!this.isRunning) break;
+
+      const strategy = strategies[si];
+      console.log(`[JobHunter] 🎯 Strategy [${si + 1}/${strategies.length}]: ${strategy.name} (${strategy.id})`);
+
+      const report = {
+        id: strategy.id,
+        name: strategy.name,
+        startTime: Date.now(),
+        endTime: null,
+        pagesAttempted: 0,
+        pagesSuccess: 0,
+        jobsListed: 0,
+        jobsDetailed: 0,
+        antiCrawlAt: null,
+        error: null,
+        result: 'pending',
+      };
+
+      const seenListJobKeys = new Set();
+      // 将已有的 allJobs 的 key 加入去重集合
+      for (const j of allJobs) {
+        const key = j.encryptJobId || j.securityId || `${j.jobName}::${j.brandName}::${j.salaryDesc}`;
+        seenListJobKeys.add(key);
+      }
+
+      let page = 1;
+      let hasMore = true;
+      let strategyAntiCrawl = false;
+
+      try {
+        if (strategy.interleaved) {
+          // ── 交错模式：列表一页 → 详情批量 → 下一页 ──
+          while (hasMore && page <= strategy.maxPages && this.isRunning) {
+            // 列表获取
+            console.log(`[JobHunter] Fetching list page ${page}/${strategy.maxPages} (strategy: ${strategy.id}, pageSize=${strategy.listPageSize})`);
+            report.pagesAttempted++;
+
+            const pageResult = await this.sendMessageToTab(tabId, {
+              type: 'SCRAPE_JOBS',
+              keyword,
+              cityCode,
+              pageSize: strategy.listPageSize,
+              experience,
+              page
+            });
+
+            if (!pageResult.success) {
+              if (this.isAntiCrawlError(pageResult.error)) {
+                console.warn(`[JobHunter] ⚠️ Strategy ${strategy.id} anti-crawl at page ${page}: ${pageResult.error}`);
+                report.antiCrawlAt = page;
+                report.error = pageResult.error;
+                report.result = 'anti_crawl';
+                strategyAntiCrawl = true;
+                if (page === 1 && allJobs.length === 0) {
+                  const cooldown = 30000 + Math.random() * 10000;
+                  console.log(`[JobHunter]   ⏱️ Page 1 anti-crawl, cooling ${(cooldown / 1000).toFixed(1)}s...`);
+                  await this.sleep(cooldown);
+                }
+                break;
+              }
+              if (typeof pageResult.error === 'string' && pageResult.error.includes('Security check required')) {
+                report.error = pageResult.error;
+                report.result = 'security_check';
+                report.endTime = Date.now();
+                strategyReport.push(report);
+                return { allJobs, filteredJobs, antiCrawlTriggered: true, strategyReport, incrementalInsertedCount, totalCount, totalListed };
+              }
+              console.warn(`[JobHunter] List page ${page} error: ${pageResult.error}`);
+              report.error = pageResult.error;
+              if (page === 1 && allJobs.length === 0) { report.result = 'error'; break; }
+              break;
+            }
+
+            report.pagesSuccess++;
+            const pageJobs = Array.isArray(pageResult.data) ? pageResult.data : [];
+            console.log(`[JobHunter] List page ${page}: ${pageJobs.length} jobs (totalCount=${pageResult.totalCount ?? 'N/A'}, hasMore=${pageResult.hasMore ?? 'N/A'})`);
+
+            if (page === 1 && pageResult.totalCount != null) {
+              totalCount = pageResult.totalCount;
+              console.log(`[JobHunter] 📊 Total available: ${totalCount}`);
+            }
+
+            hasMore = pageResult.hasMore !== false && pageJobs.length >= strategy.listPageSize;
+
+            // 去重加入缓冲区
+            const buffer = [];
+            for (const job of pageJobs) {
+              const dedupeKey = job.encryptJobId || job.securityId || `${job.jobName}::${job.brandName}::${job.salaryDesc}`;
+              if (seenListJobKeys.has(dedupeKey)) continue;
+              seenListJobKeys.add(dedupeKey);
+              buffer.push(job);
+            }
+            report.jobsListed += buffer.length;
+            totalListed += buffer.length;
+            console.log(`[JobHunter] Buffer: ${buffer.length} new jobs (${pageJobs.length - buffer.length} dedup)`);
+
+            if (pageJobs.length === 0) {
+              console.log(`[JobHunter] Empty page, end of results`);
+              break;
+            }
+
+            // 过滤
+            if (buffer.length > 0) {
+              const { kept, filtered: filteredBatch, filterReasonStats } = this.filterJobs(buffer, { manualKeyword });
+              if (filteredBatch.length > 0) {
+                this.runStats.filteredCount += filteredBatch.length;
+                filteredJobs.push(...filteredBatch.map(j => ({ ...j, city: city.name, keyword, collectedAt: new Date().toISOString() })));
+                console.log(`[JobHunter] Filtered ${filteredBatch.length}/${buffer.length} from page ${page}`);
+                if (filterReasonStats) {
+                  this.runStats.filterReasonStats = { ...(this.runStats.filterReasonStats || {}), ...filterReasonStats };
+                }
+              }
+
+              // 去重（against already seen job IDs）
+              const detailCandidates = this.selectDetailCandidates(kept, seenJobIds);
+
+              // 批量处理详情
+              if (detailCandidates.length > 0) {
+                console.log(`[JobHunter] Processing ${detailCandidates.length} details from page ${page}`);
+                for (let i = 0; i < detailCandidates.length; i++) {
+                  if (!this.isRunning) break;
+                  const job = detailCandidates[i];
+                  const globalIdx = report.jobsDetailed + 1;
+                  console.log(`[JobHunter] [detail ${globalIdx}] ${job.jobName}`);
+
+                  try {
+                    this.runStats.detailRequestedCount++;
+                    const detailResult = await this.fetchJobDetailWithRetry(tabId, job, 2);
+
+                    if (detailResult.success && detailResult.data) {
+                      this.runStats.detailSuccessCount++;
+                      if (detailResult.data._source === 'card') this.runStats.cardApiUsed++;
+                      else this.runStats.detailApiUsed++;
+                      if (detailResult.data.description?.length > 0) {
+                        this.runStats.successWithDesc++;
+                        this.runStats.detailDescriptionNonEmptyCount++;
+                      }
+
+                      const hydratedJob = {
+                        ...job,
+                        description: detailResult.data.description || '',
+                        hardRequirements: detailResult.data.hardRequirements || '',
+                        skills: detailResult.data.skills || job.skills || [],
+                        address: detailResult.data.address || '',
+                        welfareList: detailResult.data.welfareList || [],
+                        bossName: detailResult.data.bossName || job.bossName || '',
+                        bossTitle: detailResult.data.bossTitle || job.bossTitle || '',
+                        _source: detailResult.data._source || 'none',
+                        city: city.name,
+                        keyword,
+                        collectedAt: new Date().toISOString()
+                      };
+                      allJobs.push(hydratedJob);
+                      report.jobsDetailed++;
+                      await this.markJobIdSeen(job.encryptJobId, seenJobIds);
+                      console.log(`[JobHunter]   ✓ ${detailResult.data.description?.length || 0} chars`);
+
+                      if (isManualTask) {
+                        const insertResult = await this.reportJobsToController(
+                          [this.normalizeBossJobForBatchInsert(hydratedJob, deliveryBatchId)],
+                          'boss'
+                        );
+                        incrementalInsertedCount += (insertResult.inserted || 0) + (insertResult.duplicates || 0);
+                      }
+                    } else {
+                      this.runStats.failCount++;
+                      console.log(`[JobHunter]   ✗ ${detailResult.error || 'Unknown'}`);
+                      if (this.isAntiCrawlError(detailResult.error)) {
+                        await this.increaseDelay();
+                        antiCrawlTriggered = true;
+                      }
+                      allJobs.push({ ...job, description: '', city: city.name, keyword, collectedAt: new Date().toISOString() });
+                    }
+
+                    if (i < detailCandidates.length - 1) {
+                      if (!this.isRunning) break;
+                      const detailDelay = strategy.detailDelayMs + Math.random() * 3000;
+                      console.log(`[JobHunter]   ⏱️ ${(detailDelay / 1000).toFixed(1)}s...`);
+                      await this.sleep(detailDelay);
+                    }
+                  } catch (detailError) {
+                    console.error(`[JobHunter] Detail error:`, detailError);
+                    allJobs.push({ ...job, description: '', city: city.name, keyword, collectedAt: new Date().toISOString() });
+                  }
+                }
+              }
+            }
+
+            // 进度日志
+            const progress = totalCount ? `${allJobs.length}/${totalCount}` : `${allJobs.length}`;
+            console.log(`[JobHunter] 📈 Progress: ${progress} jobs, page ${page}/${strategy.maxPages}`);
+
+            page++;
+            if (hasMore && page <= strategy.maxPages && this.isRunning) {
+              const listDelay = strategy.listDelayMs + Math.random() * 3000;
+              console.log(`[JobHunter]   ⏱️ List delay ${(listDelay / 1000).toFixed(1)}s...`);
+              await this.sleep(listDelay);
+            }
+          }
+
+        } else {
+          // ── 顺序模式：先列表全获取，再统一详情 ──
+          const listResult = await this.scrapeJobListPages(tabId, {
+            keyword,
+            cityCode,
+            pageSize: strategy.listPageSize,
+            experience,
+            maxPagesOverride: strategy.maxPages
+          });
+
+          report.pagesAttempted = listResult.pagesFetched || 0;
+          report.pagesSuccess = listResult.pagesFetched || 0;
+
+          if (!listResult.success) {
+            if (this.isAntiCrawlError(listResult.error)) {
+              report.antiCrawlAt = report.pagesAttempted;
+              report.error = listResult.error;
+              report.result = 'anti_crawl';
+              strategyAntiCrawl = true;
+            } else {
+              report.error = listResult.error;
+              report.result = 'error';
+            }
+
+            if (listResult.data && listResult.data.length > 0) {
+              // partial data from sequential mode
+            } else {
+              report.endTime = Date.now();
+              strategyReport.push(report);
+              if (si < strategies.length - 1 && strategyAntiCrawl) {
+                const switchCooldown = 15000 + Math.random() * 10000;
+                console.log(`[JobHunter] 🔄 Strategy switch cooldown ${(switchCooldown / 1000).toFixed(1)}s...`);
+                await this.sleep(switchCooldown);
+              }
+              continue;
+            }
+          }
+
+          const seqJobs = listResult.data || [];
+          report.jobsListed = seqJobs.length;
+          totalListed += seqJobs.length;
+
+          // 提取 totalCount（从第一页的结果）
+          if (listResult.totalCount != null) {
+            totalCount = listResult.totalCount;
+          }
+
+          // 过滤
+          const { kept, filtered: filteredBatch, filterReasonStats } = this.filterJobs(seqJobs, { manualKeyword });
+          if (filteredBatch.length > 0) {
+            this.runStats.filteredCount += filteredBatch.length;
+            filteredJobs.push(...filteredBatch.map(j => ({ ...j, city: city.name, keyword, collectedAt: new Date().toISOString() })));
+            if (filterReasonStats) {
+              this.runStats.filterReasonStats = { ...(this.runStats.filterReasonStats || {}), ...filterReasonStats };
+            }
+          }
+
+          const detailCandidates = this.selectDetailCandidates(kept, seenJobIds);
+
+          // 冷却
+          if (detailCandidates.length > 0) {
+            const cooldown = strategy.listDelayMs + Math.random() * 2000;
+            console.log(`[JobHunter] ⏱️ Post-list cooldown ${(cooldown / 1000).toFixed(1)}s...`);
+            await this.sleep(cooldown);
+          }
+
+          // 详情处理
+          for (let i = 0; i < detailCandidates.length; i++) {
+            if (!this.isRunning) break;
+            const job = detailCandidates[i];
+            console.log(`[JobHunter] [${i + 1}/${detailCandidates.length}] ${job.jobName}`);
+
+            try {
+              this.runStats.detailRequestedCount++;
+              const detailResult = await this.fetchJobDetailWithRetry(tabId, job, 2);
+
+              if (detailResult.success && detailResult.data) {
+                this.runStats.detailSuccessCount++;
+                if (detailResult.data._source === 'card') this.runStats.cardApiUsed++;
+                else this.runStats.detailApiUsed++;
+                if (detailResult.data.description?.length > 0) {
+                  this.runStats.successWithDesc++;
+                  this.runStats.detailDescriptionNonEmptyCount++;
+                }
+                const hydratedJob = {
+                  ...job,
+                  description: detailResult.data.description || '',
+                  hardRequirements: detailResult.data.hardRequirements || '',
+                  skills: detailResult.data.skills || job.skills || [],
+                  address: detailResult.data.address || '',
+                  welfareList: detailResult.data.welfareList || [],
+                  bossName: detailResult.data.bossName || job.bossName || '',
+                  bossTitle: detailResult.data.bossTitle || job.bossTitle || '',
+                  _source: detailResult.data._source || 'none',
+                  city: city.name,
+                  keyword,
+                  collectedAt: new Date().toISOString()
+                };
+                allJobs.push(hydratedJob);
+                report.jobsDetailed++;
+                await this.markJobIdSeen(job.encryptJobId, seenJobIds);
+                console.log(`[JobHunter]   ✓ ${detailResult.data.description?.length || 0} chars`);
+
+                if (isManualTask) {
+                  const insertResult = await this.reportJobsToController(
+                    [this.normalizeBossJobForBatchInsert(hydratedJob, deliveryBatchId)],
+                    'boss'
+                  );
+                  incrementalInsertedCount += (insertResult.inserted || 0) + (insertResult.duplicates || 0);
+                }
+              } else {
+                this.runStats.failCount++;
+                if (this.isAntiCrawlError(detailResult.error)) {
+                  await this.increaseDelay();
+                  antiCrawlTriggered = true;
+                }
+                allJobs.push({ ...job, description: '', city: city.name, keyword, collectedAt: new Date().toISOString() });
+              }
+
+              if (i < detailCandidates.length - 1) {
+                if (!this.isRunning) break;
+                const detailDelay = strategy.detailDelayMs + Math.random() * 3000;
+                console.log(`[JobHunter]   ⏱️ ${(detailDelay / 1000).toFixed(1)}s...`);
+                await this.sleep(detailDelay);
+              }
+            } catch (detailError) {
+              console.error(`[JobHunter] Detail error:`, detailError);
+              allJobs.push({ ...job, description: '', city: city.name, keyword, collectedAt: new Date().toISOString() });
+            }
+          }
+        }
+
+        if (!strategyAntiCrawl) {
+          report.result = 'success';
+          report.endTime = Date.now();
+          strategyReport.push(report);
+          console.log(`[JobHunter] ✅ Strategy ${strategy.id}: ${report.jobsDetailed} detailed in ${((report.endTime - report.startTime) / 1000).toFixed(1)}s`);
+          break; // 策略成功，不再尝试下一个
+        }
+      } catch (error) {
+        report.error = error.message;
+        report.result = 'error';
+        console.error(`[JobHunter] Strategy ${strategy.id} error:`, error);
+      }
+
+      report.endTime = Date.now();
+      strategyReport.push(report);
+
+      if (strategyAntiCrawl && si < strategies.length - 1) {
+        console.log(`[JobHunter] 🔄 Switching to next strategy...`);
+        const switchCooldown = 15000 + Math.random() * 10000;
+        console.log(`[JobHunter]   ⏱️ Switch cooldown ${(switchCooldown / 1000).toFixed(1)}s...`);
+        await this.sleep(switchCooldown);
+      }
+    }
+
+    // 策略报告
+    console.log(`[JobHunter] ========================================`);
+    console.log(`[JobHunter] 📋 Strategy Report:`);
+    for (const r of strategyReport) {
+      const duration = r.endTime ? ((r.endTime - r.startTime) / 1000).toFixed(1) + 's' : 'N/A';
+      console.log(`[JobHunter]   [${r.id}] ${r.result} | pages: ${r.pagesSuccess}/${r.pagesAttempted} | listed: ${r.jobsListed} | detailed: ${r.jobsDetailed} | ${duration}${r.antiCrawlAt ? ` | anti-crawl@p${r.antiCrawlAt}` : ''}${r.error ? ` | err: ${r.error.substring(0, 80)}` : ''}`);
+    }
+    console.log(`[JobHunter] Total: ${allJobs.length} collected${totalCount ? ` / ${totalCount} available` : ''}, ${filteredJobs.length} filtered`);
+
+    // 如果所有策略都失败了（全是 anti_crawl），标记反爬触发
+    if (strategyReport.length > 0 && strategyReport.every(r => r.result === 'anti_crawl') && allJobs.length === 0) {
+      antiCrawlTriggered = true;
+    }
+
+    return { allJobs, filteredJobs, antiCrawlTriggered, strategyReport, incrementalInsertedCount, totalCount, totalListed };
   }
 
   buildTaskResult({ city, keyword, taskId, status, total, pushed, filtered, errorCode, errorMessage, withDescription }) {
