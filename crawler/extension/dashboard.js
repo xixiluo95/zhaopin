@@ -1336,6 +1336,21 @@ function escapeResumeAttr(value) {
   return escapeHtml(String(value == null ? '' : value)).replace(/"/g, '&quot;');
 }
 
+/**
+ * 清洗文本中残余的 Markdown 内联格式标记
+ */
+function stripInlineMarkdown(text) {
+  if (!text) return '';
+  return text
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/_([^_]+)_/g, '$1')
+    .replace(/~~([^~]+)~~/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+}
+
 function normalizeResumeSource(markdown) {
   let text = String(markdown || '').replace(/\r/g, '\n');
   text = text.replace(/(^|\n)\s*[\u25a1\uF0B7\u2022\u25CF\u25E6\u00B7▪■◆★☆►▶]+\s*/g, '$1- ');
@@ -1390,20 +1405,20 @@ function parseResumeStructure(markdown) {
   }
 
   const joined = lines.join('\n');
-  model.name = extractLabelValue(joined, ['姓名']) || '';
+  model.name = stripInlineMarkdown(extractLabelValue(joined, ['姓名']) || '');
   if (!model.name) {
     const firstLine = lines[0].replace(/^#\s*/, '');
     if (firstLine && !knownSections.has(firstLine) && firstLine.length <= 24) {
-      model.name = firstLine;
+      model.name = stripInlineMarkdown(firstLine);
     }
   }
 
   const titleLine = extractLabelValue(joined, ['求职意向', '目标岗位', '应聘岗位']);
   if (titleLine) {
-    model.headline = titleLine;
+    model.headline = stripInlineMarkdown(titleLine);
   } else {
     const secondLine = lines.find(line => /产品|运营|开发|设计|数据|经理|工程师|实习|分析/.test(line));
-    model.headline = secondLine && secondLine !== model.name ? secondLine : '';
+    model.headline = secondLine && secondLine !== model.name ? stripInlineMarkdown(secondLine) : '';
   }
 
   const metaPairs = [
@@ -1433,7 +1448,7 @@ function parseResumeStructure(markdown) {
     if (!line) continue;
 
     if (knownSections.has(line)) {
-      currentSection = { title: line, items: [] };
+      currentSection = { title: stripInlineMarkdown(line), items: [] };
       model.sections.push(currentSection);
       continue;
     }
@@ -1444,7 +1459,7 @@ function parseResumeStructure(markdown) {
     }
 
     splitResumeSentences(line).forEach((item) => {
-      currentSection.items.push(item);
+      currentSection.items.push(stripInlineMarkdown(item));
     });
   }
 
@@ -1454,11 +1469,11 @@ function parseResumeStructure(markdown) {
       line !== model.headline &&
       !/^姓名[:：]|^电话[:：]|^联系电话[:：]|^邮箱[:：]|^电子邮件[:：]|^微信[:：]|^现居地[:：]|^所在地[:：]|^学历[:：]|^专业[:：]|^学校[:：]|^毕业院校[:：]/.test(line)
     ));
-    model.summary = summaryCandidates.slice(0, 3).join(' ');
+    model.summary = stripInlineMarkdown(summaryCandidates.slice(0, 3).join(' '));
   }
 
   if (!model.sections.length) {
-    const fallbackItems = splitResumeSentences(lines.join('\n'));
+    const fallbackItems = splitResumeSentences(lines.join('\n')).map(stripInlineMarkdown);
     model.sections.push({
       title: '简历内容',
       items: fallbackItems,
@@ -2235,20 +2250,43 @@ const RESUME_DOCUMENT_CSS = `
   margin: 15mm;
 }
 @media print {
+  body.resume-doc-shell {
+    padding: 0;
+    background: white;
+  }
   .resume-sheet {
-    page-break-after: auto;
+    border: none;
+    box-shadow: none;
+    overflow: visible;
+    max-width: none;
+  }
+  .resume-sheet__header {
+    page-break-inside: avoid;
+    page-break-after: avoid;
   }
   .resume-section {
-    page-break-inside: avoid;
+    /* Allow sections to break across pages - this fixes BUG-01 */
+    page-break-inside: auto;
   }
-  h1, h2, h3 {
+  .resume-section__title {
     page-break-after: avoid;
+  }
+  .resume-entry {
+    page-break-inside: avoid;
   }
   .resume-block {
     page-break-inside: avoid;
   }
   .resume-list li {
     page-break-inside: avoid;
+  }
+  h1, h2, h3 {
+    page-break-after: avoid;
+  }
+  /* Ensure reasonable orphans/widows */
+  p {
+    orphans: 3;
+    widows: 3;
   }
 }
   :root {
@@ -2278,7 +2316,7 @@ const RESUME_DOCUMENT_CSS = `
     background: var(--resume-paper);
     border: 3px solid var(--resume-border);
     box-shadow: 14px 14px 0 rgba(26, 26, 26, 0.08);
-    overflow: hidden;
+    overflow: visible;
   }
 
   .resume-sheet--structured .resume-sheet__header {
@@ -4582,6 +4620,26 @@ const AI_PROVIDER_DEFAULTS = {
     label: 'OpenAI',
     base_url: 'https://api.openai.com/v1',
     model: 'gpt-4o',
+  },
+  'groq': {
+    label: 'Groq',
+    base_url: 'https://api.groq.com/openai/v1',
+    model: 'llama-3.3-70b-versatile',
+  },
+  'deepseek': {
+    label: 'DeepSeek',
+    base_url: 'https://api.deepseek.com/v1',
+    model: 'deepseek-chat',
+  },
+  'doubao': {
+    label: '豆包(火山引擎)',
+    base_url: 'https://ark.cn-beijing.volces.com/api/v3',
+    model: 'doubao-pro-32k',
+  },
+  'siliconflow': {
+    label: 'SiliconFlow',
+    base_url: 'https://api.siliconflow.cn/v1',
+    model: 'deepseek-ai/DeepSeek-V3',
   },
   'custom': {
     label: '自定义',

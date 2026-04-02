@@ -49,6 +49,22 @@ const AI_TEMPLATE_REFERENCE_FILES = [
   process.env.ZHAOPIN_AI_TEMPLATE_PDF_2 || '/home/xixil/下载/简历张三模板 (1).pdf'
 ];
 
+/**
+ * Strip inline markdown formatting from AI-generated resume content (BUG-06).
+ * Preserves heading markers (#) needed by parseResumeStructure().
+ */
+function sanitizeAIResumeMarkdown(md) {
+  if (!md) return '';
+  return md
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/~~([^~]+)~~/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/^[-*_]{3,}\s*$/gm, '');
+}
+
 const REFERENCE_TEXT_LIMIT = 3500;
 const PROJECT_SKILL_FILE = path.join(__dirname, '../SKILL.md');
 const ASSISTANT_MAX_TOOL_STEPS = 6;
@@ -728,7 +744,7 @@ async function executeAssistantTool({ db, toolName, args, currentJobId, resume }
       return { sql, rows };
     }
     case 'update_resume': {
-      const contentMd = String(args?.content_md || '').trim();
+      const contentMd = sanitizeAIResumeMarkdown(String(args?.content_md || '').trim());
       const reason = String(args?.reason || '').trim();
       if (!contentMd) {
         throw new Error('content_md 不能为空');

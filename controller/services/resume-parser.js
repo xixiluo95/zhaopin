@@ -110,6 +110,20 @@ function sanitizeResumeMarkdown(md) {
     .replace(/\(data:image\/[^)]{20,}\)/g, '')
     .replace(/data:image\/[a-z]+;base64,[A-Za-z0-9+/=]{50,}/g, '')
     .replace(/\n{3,}/g, '\n\n')
+    // Strip markdown heading markers (keep the text)
+    .replace(/^#{1,6}\s+/gm, '')
+    // Strip horizontal rules
+    .replace(/^[-*_]{3,}\s*$/gm, '')
+    // Convert markdown links [text](url) to just text
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    // Strip bold markers **text** → text
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    // Strip italic markers *text* → text
+    .replace(/\*([^*]+)\*/g, '$1')
+    // Strip bullet list markers at line start (but preserve the text)
+    .replace(/^[\s]*[-*+]\s+/gm, '')
+    // Strip numbered list markers at line start
+    .replace(/^[\s]*\d+\.\s+/gm, '')
     .trim();
 }
 

@@ -2,7 +2,7 @@
  * llm-factory.js - LLM 工厂
  *
  * 根据 provider 配置动态实例化对应的 Provider。
- * 当前所有主流厂商（智谱AI、Kimi、OpenAI、Groq）均走 OpenAI 兼容层。
+ * 当前所有主流厂商（智谱AI、Kimi、OpenAI、Groq、DeepSeek、豆包、SiliconFlow）均走 OpenAI 兼容层。
  */
 
 const { createOpenAIProvider } = require('./openai-compatible-provider');
@@ -19,6 +19,9 @@ function createLLMClient(config) {
         case 'kimi':
         case 'openai':
         case 'groq':
+        case 'deepseek':
+        case 'doubao':
+        case 'siliconflow':
         case 'custom':
             return createOpenAIProvider(config);
         default:
