@@ -91,6 +91,15 @@ package-lock.json
 .idea/
 .vscode/
 
+# Credential files
+.env
+.env.*
+*.env
+
+# Backup files
+*.backup
+*.backup.*
+
 # Temporary scripts
 controller/_*.js
 controller/test_*.js
