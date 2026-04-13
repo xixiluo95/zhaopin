@@ -1709,12 +1709,10 @@ function applyWorkspaceLayoutState() {
   const aiContainer = document.getElementById('ws-ai-content');
   if (!ws || !btn || !aiPanel || !resumePanel || !aiContainer) return;
 
-  const noFavorites = workspaceFavoriteCount === 0;
-
   ws.classList.toggle('ws--assistant', workspaceAssistantVisible);
-  ws.classList.toggle('ws--assistant-no-favorites', workspaceAssistantVisible && noFavorites);
+  ws.classList.remove('ws--assistant-no-favorites');
   aiPanel.style.display = workspaceAssistantVisible ? 'flex' : 'none';
-  resumePanel.style.display = workspaceAssistantVisible && noFavorites ? 'none' : '';
+  resumePanel.style.display = '';
   btn.textContent = workspaceAssistantVisible ? '关闭 AI' : 'AI 助手';
   btn.classList.toggle('is-active', workspaceAssistantVisible);
 

@@ -756,10 +756,11 @@ a {
 
 #view-resume {
     position: relative;
-    height: calc(100vh - 52px);
+    height: 100vh;
     overflow: hidden;
     padding: 0;
-    margin-top: 52px;
+    padding-top: 52px;
+    box-sizing: border-box;
 }
 
 /* ========================================

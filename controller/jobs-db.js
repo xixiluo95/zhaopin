@@ -309,7 +309,8 @@ function toggleFavorite(id) {
   if (!job) return null;
 
   const newValue = job.is_favorite ? 0 : 1;
-  db.prepare('UPDATE scraped_jobs SET is_favorite = ? WHERE id = ?').run(newValue, id);
+  const selectedValue = newValue;
+  db.prepare('UPDATE scraped_jobs SET is_favorite = ?, selected = ? WHERE id = ?').run(newValue, selectedValue, id);
   return { isFavorite: newValue === 1 };
 }
 
@@ -326,7 +327,8 @@ function setFavorite(id, isFavorite) {
   if (!job) return null;
 
   const value = isFavorite ? 1 : 0;
-  db.prepare('UPDATE scraped_jobs SET is_favorite = ? WHERE id = ?').run(value, id);
+  const selectedValue = value;
+  db.prepare('UPDATE scraped_jobs SET is_favorite = ?, selected = ? WHERE id = ?').run(value, selectedValue, id);
   return { isFavorite: value === 1 };
 }
 
@@ -339,14 +341,14 @@ function setFavorite(id, isFavorite) {
  */
 function batchSetFavorite(ids, isFavorite) {
   const db = getDatabase();
-  const stmt = db.prepare('UPDATE scraped_jobs SET is_favorite = ? WHERE id = ?');
   const value = isFavorite ? 1 : 0;
+  const stmt = db.prepare('UPDATE scraped_jobs SET is_favorite = ?, selected = ? WHERE id = ?');
   let updated = 0;
 
   for (const rawId of ids) {
     const id = Number(rawId);
     if (!Number.isInteger(id) || id <= 0) continue;
-    const result = stmt.run(value, id);
+    const result = stmt.run(value, value, id);
     if (result.changes > 0) updated += 1;
   }
 
@@ -403,6 +405,17 @@ function getRecentlyCrawledJobs(withinHours = 24, limit = 500) {
 function getFavoriteJobs() {
   const db = getDatabase();
   return db.prepare('SELECT * FROM scraped_jobs WHERE is_favorite = 1 ORDER BY datetime(crawled_at) DESC, id DESC').all();
+}
+
+/**
+ * 一键清空所有收藏/选中状态（含脏数据 selected=1,is_favorite=0）
+ *
+ * @returns {{ cleared: number }}
+ */
+function clearAllFavorites() {
+  const db = getDatabase();
+  const result = db.prepare('UPDATE scraped_jobs SET is_favorite = 0, selected = 0 WHERE is_favorite = 1 OR selected = 1').run();
+  return { cleared: result.changes };
 }
 
 /**
@@ -752,6 +765,7 @@ module.exports = {
   toggleFavorite,
   setFavorite,
   batchSetFavorite,
+  clearAllFavorites,
   batchCollectToWorkbench,
   getRecentlyCrawledJobs,
   getFavoriteJobs,

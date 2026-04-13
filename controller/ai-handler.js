@@ -587,6 +587,17 @@ const ASSISTANT_TOOL_SCHEMAS = [
     },
     returns: '返回实际移出工作台的数量。'
   },
+  {
+    name: 'clear_all_favorites',
+    description: '一键清空所有收藏岗位。当用户要求"清空收藏列表"、"移除所有"时使用此工具，不需要传 job_ids。',
+    parameters: {
+      type: 'object',
+      properties: {},
+      required: [],
+      additionalProperties: false
+    },
+    returns: '返回清除的岗位数量。'
+  },
 ];
 
 function getAssistantToolSchemaMap() {
@@ -730,6 +741,7 @@ function getToolExecutionMeta(toolName) {
     smart_job_recommend: 'controller/services/job-recommender.js',
     batch_select_jobs: 'controller/jobs-db.js',
     batch_deselect_jobs: 'controller/jobs-db.js',
+    clear_all_favorites: 'controller/jobs-db.js',
   };
 
   return {
@@ -751,6 +763,8 @@ function summarizeToolResult(toolName, toolResult) {
       return `已加入工作台 ${toolResult.updated || 0} 条`;
     case 'batch_deselect_jobs':
       return `已移出工作台 ${toolResult.updated || 0} 条`;
+    case 'clear_all_favorites':
+      return `已清空全部收藏 ${toolResult.cleared || 0} 条`;
     case 'search_jobs_db':
       return `命中 ${Array.isArray(toolResult.jobs) ? toolResult.jobs.length : 0} 条岗位`;
     case 'list_selected_jobs':
@@ -1691,6 +1705,10 @@ async function executeAssistantTool({ db, toolName, args, currentJobId, resume, 
       const result = jobsDb.batchSetFavorite(deselectIds, false);
       return { success: true, updated: result.updated, total: result.total };
     }
+    case 'clear_all_favorites': {
+      const clearResult = jobsDb.clearAllFavorites();
+      return { success: true, cleared: clearResult.cleared };
+    }
     default:
       throw new Error(`未知工具: ${toolName}`);
   }
@@ -1896,6 +1914,7 @@ async function runAssistantLoopWithProgress({ llmClient, systemPrompt, conversat
           smart_job_recommend: '🎯 正在智能推荐岗位...',
           batch_select_jobs: '📥 正在加入工作台...',
           batch_deselect_jobs: '📤 正在移出工作台...',
+        clear_all_favorites: '🗑️ 正在清空全部收藏...',
         };
         onProgress({ type: 'tool', tool: toolName, message: TOOL_LABELS[toolName] || `🔧 正在执行 ${toolName}...` });
 
@@ -1996,6 +2015,7 @@ async function runAssistantLoopWithProgress({ llmClient, systemPrompt, conversat
         smart_job_recommend: '🎯 正在智能推荐岗位...',
         batch_select_jobs: '📥 正在加入工作台...',
         batch_deselect_jobs: '📤 正在移出工作台...',
+        clear_all_favorites: '🗑️ 正在清空全部收藏...',
       };
       onProgress({
         type: 'trace',
