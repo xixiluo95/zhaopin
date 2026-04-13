@@ -11,7 +11,7 @@ const { createOpenAIProvider } = require('./openai-compatible-provider');
  * 根据 provider 创建 LLM 客户端
  *
  * @param {import('./llm-contracts').LLMConfig} config
- * @returns {{ chat: (messages: import('./llm-contracts').ChatMessage[]) => Promise<import('./llm-contracts').LLMResponse> }}
+ * @returns {{ chat: (messages: import('./llm-contracts').ChatMessage[], options?: import('./llm-contracts').ChatOptions) => Promise<import('./llm-contracts').LLMResponse>, supportsNativeTools?: () => boolean }}
  */
 function createLLMClient(config) {
     switch (config.provider) {
@@ -33,7 +33,7 @@ function createLLMClient(config) {
  * 从数据库获取当前激活的 AI 配置并创建客户端
  *
  * @param {import('better-sqlite3').Database} db - better-sqlite3 实例
- * @returns {{ chat: (messages: import('./llm-contracts').ChatMessage[]) => Promise<import('./llm-contracts').LLMResponse> } | null}
+ * @returns {{ chat: (messages: import('./llm-contracts').ChatMessage[], options?: import('./llm-contracts').ChatOptions) => Promise<import('./llm-contracts').LLMResponse>, supportsNativeTools?: () => boolean } | null}
  */
 function createActiveLLMClient(db) {
     const config = db.prepare(

@@ -314,6 +314,88 @@ function toggleFavorite(id) {
 }
 
 /**
+ * 显式设置收藏状态（幂等）
+ *
+ * @param {number} id
+ * @param {boolean} isFavorite
+ * @returns {{ isFavorite: boolean }|null}
+ */
+function setFavorite(id, isFavorite) {
+  const db = getDatabase();
+  const job = db.prepare('SELECT id FROM scraped_jobs WHERE id = ?').get(id);
+  if (!job) return null;
+
+  const value = isFavorite ? 1 : 0;
+  db.prepare('UPDATE scraped_jobs SET is_favorite = ? WHERE id = ?').run(value, id);
+  return { isFavorite: value === 1 };
+}
+
+/**
+ * 批量显式设置收藏状态（幂等）
+ *
+ * @param {number[]} ids
+ * @param {boolean} isFavorite
+ * @returns {{ updated: number, total: number }}
+ */
+function batchSetFavorite(ids, isFavorite) {
+  const db = getDatabase();
+  const stmt = db.prepare('UPDATE scraped_jobs SET is_favorite = ? WHERE id = ?');
+  const value = isFavorite ? 1 : 0;
+  let updated = 0;
+
+  for (const rawId of ids) {
+    const id = Number(rawId);
+    if (!Number.isInteger(id) || id <= 0) continue;
+    const result = stmt.run(value, id);
+    if (result.changes > 0) updated += 1;
+  }
+
+  return { updated, total: ids.length };
+}
+
+/**
+ * 批量加入工作台卡片区
+ * 同时设置 selected=1 和 is_favorite=1，语义与“加入收藏列表”保持一致。
+ *
+ * @param {number[]} ids
+ * @returns {{ updated: number, total: number }}
+ */
+function batchCollectToWorkbench(ids) {
+  const db = getDatabase();
+  const stmt = db.prepare('UPDATE scraped_jobs SET selected = 1, is_favorite = 1 WHERE id = ?');
+  let updated = 0;
+
+  for (const rawId of ids) {
+    const id = Number(rawId);
+    if (!Number.isInteger(id) || id <= 0) continue;
+    const result = stmt.run(id);
+    if (result.changes > 0) updated += 1;
+  }
+
+  return { updated, total: ids.length };
+}
+
+/**
+ * 获取最近入库的岗位
+ *
+ * @param {number} withinHours
+ * @param {number} [limit=500]
+ * @returns {Array<Object>}
+ */
+function getRecentlyCrawledJobs(withinHours = 24, limit = 500) {
+  const db = getDatabase();
+  const safeHours = Math.max(1, Number(withinHours) || 24);
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 500, 2000));
+  return db.prepare(`
+    SELECT id, title, company, location, salary, experience, education, keywords, raw_payload, platform, crawled_at, is_favorite, selected
+    FROM scraped_jobs
+    WHERE datetime(crawled_at) >= datetime('now', ?)
+    ORDER BY datetime(crawled_at) DESC, id DESC
+    LIMIT ?
+  `).all(`-${safeHours} hours`, safeLimit);
+}
+
+/**
  * 获取所有已收藏的职位
  *
  * @returns {Array<Object>}
@@ -668,6 +750,10 @@ module.exports = {
   batchSelect,
   getSelectedJobs,
   toggleFavorite,
+  setFavorite,
+  batchSetFavorite,
+  batchCollectToWorkbench,
+  getRecentlyCrawledJobs,
   getFavoriteJobs,
   clearUnselectedJobs,
   clearAllJobs,

@@ -954,6 +954,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === '/api/jobs/favorite' && req.method === 'POST') {
+    jobsHandler.handleSetFavorite(req, res);
+    return;
+  }
+
   if (url.pathname === '/api/jobs/clear' && req.method === 'POST') {
     jobsHandler.handleClearAllJobs(req, res);
     return;

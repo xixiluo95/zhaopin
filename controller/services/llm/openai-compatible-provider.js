@@ -21,24 +21,69 @@ function createOpenAIProvider(config) {
         baseURL: config.baseURL,
     });
 
+    function supportsNativeTools() {
+        return true;
+    }
+
+    function normalizeMessages(messages) {
+        return (messages || []).map((message) => {
+            const normalized = {
+                role: message.role,
+            };
+            if (message.content !== undefined) normalized.content = message.content;
+            if (message.name !== undefined) normalized.name = message.name;
+            if (message.tool_call_id !== undefined) normalized.tool_call_id = message.tool_call_id;
+            return normalized;
+        });
+    }
+
     return {
         /**
          * 发送聊天请求（非流式）
          *
          * @param {import('./llm-contracts').ChatMessage[]} messages
+         * @param {import('./llm-contracts').ChatOptions} [options]
          * @returns {Promise<import('./llm-contracts').LLMResponse>}
          */
-        async chat(messages) {
+        async chat(messages, options = {}) {
             try {
-                const response = await client.chat.completions.create({
+                const payload = {
                     model: config.model,
-                    messages,
-                });
+                    messages: normalizeMessages(messages),
+                };
+                if (Array.isArray(options.tools) && options.tools.length > 0) {
+                    payload.tools = options.tools;
+                    payload.tool_choice = options.toolChoice || 'auto';
+                }
+
+                const response = await client.chat.completions.create(payload);
+                const choice = response.choices[0] || {};
+                const message = choice.message || {};
                 return {
-                    content: response.choices[0]?.message?.content || '',
+                    content: message.content || '',
                     usage: response.usage,
+                    toolCalls: Array.isArray(message.tool_calls) ? message.tool_calls : [],
+                    finishReason: choice.finish_reason,
                 };
             } catch (err) {
+                if (options?.tools?.length) {
+                    try {
+                        const fallbackResponse = await client.chat.completions.create({
+                            model: config.model,
+                            messages: normalizeMessages(messages),
+                        });
+                        const choice = fallbackResponse.choices[0] || {};
+                        const message = choice.message || {};
+                        return {
+                            content: message.content || '',
+                            usage: fallbackResponse.usage,
+                            toolCalls: [],
+                            finishReason: choice.finish_reason,
+                        };
+                    } catch {
+                        // ignore fallback error, return original err
+                    }
+                }
                 return { content: '', error: err };
             }
         },
@@ -72,6 +117,8 @@ function createOpenAIProvider(config) {
                 return { content: fullContent || '', error: err };
             }
         },
+
+        supportsNativeTools,
     };
 }
 

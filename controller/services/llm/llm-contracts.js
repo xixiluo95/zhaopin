@@ -7,8 +7,29 @@
 
 /**
  * @typedef {Object} ChatMessage
- * @property {'system'|'user'|'assistant'} role
- * @property {string} content
+ * @property {'system'|'user'|'assistant'|'tool'} role
+ * @property {string} [content]
+ * @property {string} [tool_call_id]
+ * @property {string} [name]
+ */
+
+/**
+ * @typedef {Object} ToolDefinition
+ * @property {'function'} type
+ * @property {{name: string, description?: string, parameters?: object}} function
+ */
+
+/**
+ * @typedef {Object} ToolCall
+ * @property {string} id
+ * @property {'function'} type
+ * @property {{name: string, arguments: string}} function
+ */
+
+/**
+ * @typedef {Object} ChatOptions
+ * @property {ToolDefinition[]} [tools]
+ * @property {'auto'|'none'|{type:'function',function:{name:string}}} [toolChoice]
  */
 
 /**
@@ -24,6 +45,8 @@
  * @property {string} content - AI 返回的文本
  * @property {number} [usage] - Token 用量（如厂商支持）
  * @property {Error} [error] - 错误对象（调用失败时）
+ * @property {ToolCall[]} [toolCalls] - 原生 function/tool calling 返回
+ * @property {string} [finishReason] - 模型结束原因
  */
 
 /**

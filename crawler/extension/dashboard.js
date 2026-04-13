@@ -4,7 +4,7 @@
  */
 
 import {
-  fetchJobs, fetchJobDetail, selectJob, favoriteJob,
+  fetchJobs, fetchJobDetail, selectJob, favoriteJob, setFavoriteJob, batchFavoriteJobs,
   fetchDeliveryList, uploadResume, fetchResume,
   updateResumeContent, getAIConfig, saveAIConfig,
   optimizeResume, matchJobs, exportPDFViaAPI, clearAllJobs,
@@ -1192,6 +1192,8 @@ let currentResumeMode = 'view';    // 'view' | 'edit'
 let aiConfigured = false;          // AI 是否已配置
 let currentResumeDraftMd = '';     // 稳定简历草稿源，模板切换不修改此变量
 let aiConversationHistory = [];    // AI 助手对话历史
+let workspaceAssistantVisible = false;
+let workspaceFavoriteCount = 0;
 const RESUME_TEMPLATE_STORAGE_KEY = 'jobhunter_resume_template';
 const RESUME_TEMPLATE_OPTIONS = [
   { id: 'structured', label: '结构版' },
@@ -1213,10 +1215,17 @@ function loadAssistantSessions() {
   } catch { return {}; }
 }
 
-function saveAssistantSession(jobId, messages) {
+function normalizeAssistantSessionKey(target) {
+  if (target === null || target === undefined || target === '') {
+    return 'workspace-main';
+  }
+  return String(target);
+}
+
+function saveAssistantSession(target, messages) {
   try {
     const sessions = loadAssistantSessions();
-    sessions[jobId] = {
+    sessions[normalizeAssistantSessionKey(target)] = {
       messages: messages.slice(-50), // 最多保留50条
       updatedAt: Date.now(),
     };
@@ -1224,15 +1233,15 @@ function saveAssistantSession(jobId, messages) {
   } catch (e) { console.warn('[AI Session] save failed:', e); }
 }
 
-function loadAssistantSession(jobId) {
+function loadAssistantSession(target) {
   const sessions = loadAssistantSessions();
-  return sessions[jobId]?.messages || [];
+  return sessions[normalizeAssistantSessionKey(target)]?.messages || [];
 }
 
-function clearAssistantSession(jobId) {
+function clearAssistantSession(target) {
   try {
     const sessions = loadAssistantSessions();
-    delete sessions[jobId];
+    delete sessions[normalizeAssistantSessionKey(target)];
     localStorage.setItem(ASSISTANT_SESSIONS_KEY, JSON.stringify(sessions));
   } catch {}
 }
@@ -1656,19 +1665,67 @@ function loadResumeView() {
           <div id="delivery-content"></div>
         </div>
         <div class="ws-res" id="wsResPanel">
-          <h3 class="ws-res__title">简历预览</h3>
+          <div class="ws-res__head">
+            <h3 class="ws-res__title">简历预览</h3>
+            <button class="res-btn res-btn--ai" id="ws-ai-toggle-btn" type="button">AI 助手</button>
+          </div>
           <div id="resume-content"></div>
           <div class="upload-btn" id="btn-upload-inline" style="display:none">&#128196; 简历上传</div>
+        </div>
+        <div class="ws-ai" id="wsAiPanel" style="display:none">
+          <div id="ws-ai-content" class="ws-ai__content"></div>
         </div>
       </div>
     `;
 
+    bindWorkspaceAssistantToggle();
     resumeViewInitialized = true;
   }
 
   loadResume();
   loadDeliveryList();
   checkAIConfigured();
+  applyWorkspaceLayoutState();
+}
+
+function bindWorkspaceAssistantToggle() {
+  const btn = document.getElementById('ws-ai-toggle-btn');
+  if (!btn) return;
+
+  btn.addEventListener('click', () => {
+    if (currentSplitJobId) {
+      closeSplitView();
+    }
+    workspaceAssistantVisible = !workspaceAssistantVisible;
+    applyWorkspaceLayoutState();
+  });
+}
+
+function applyWorkspaceLayoutState() {
+  const ws = document.querySelector('#view-resume .ws');
+  const btn = document.getElementById('ws-ai-toggle-btn');
+  const aiPanel = document.getElementById('wsAiPanel');
+  const resumePanel = document.getElementById('wsResPanel');
+  const aiContainer = document.getElementById('ws-ai-content');
+  if (!ws || !btn || !aiPanel || !resumePanel || !aiContainer) return;
+
+  const noFavorites = workspaceFavoriteCount === 0;
+
+  ws.classList.toggle('ws--assistant', workspaceAssistantVisible);
+  ws.classList.toggle('ws--assistant-no-favorites', workspaceAssistantVisible && noFavorites);
+  aiPanel.style.display = workspaceAssistantVisible ? 'flex' : 'none';
+  resumePanel.style.display = workspaceAssistantVisible && noFavorites ? 'none' : '';
+  btn.textContent = workspaceAssistantVisible ? '关闭 AI' : 'AI 助手';
+  btn.classList.toggle('is-active', workspaceAssistantVisible);
+
+  if (workspaceAssistantVisible) {
+    loadSplitRightAssistant(null, {
+      containerId: 'ws-ai-content',
+      sessionKey: 'workspace-main'
+    });
+  } else {
+    aiContainer.innerHTML = '';
+  }
 }
 
 /**
@@ -3376,6 +3433,7 @@ async function loadDeliveryList() {
   try {
     const data = await fetchDeliveryList();
     const jobs = data.jobs || [];
+    workspaceFavoriteCount = jobs.length;
 
     if (countEl) {
       countEl.textContent = jobs.length > 0 ? `${jobs.length}` : '';
@@ -3384,14 +3442,18 @@ async function loadDeliveryList() {
 
     if (jobs.length === 0) {
       container.innerHTML = '<div class="empty-state">暂无收藏岗位</div>';
+      applyWorkspaceLayoutState();
       return;
     }
 
     container.innerHTML = `<div class="delivery-list">${jobs.map(job => renderDeliveryItem(job)).join('')}</div>`;
     bindDeliveryEvents(container);
+    applyWorkspaceLayoutState();
   } catch (err) {
     container.innerHTML = '<div class="empty-state"></div>';
+    workspaceFavoriteCount = 0;
     if (countEl) { countEl.textContent = ''; countEl.style.display = 'none'; }
+    applyWorkspaceLayoutState();
     showToast('加载收藏列表失败: ' + err.message, 'error');
   }
 }
@@ -3524,6 +3586,8 @@ function bindDeliveryEvents(container) {
 async function openSplitView(jobId) {
   currentSplitJobId = jobId;
   document.body.classList.remove('ai-active');
+  workspaceAssistantVisible = false;
+  applyWorkspaceLayoutState();
   const wsContainer = document.querySelector('.ws');
   const splitEl = document.getElementById('splitView');
   if (wsContainer) wsContainer.style.display = 'none';
@@ -3855,10 +3919,13 @@ function bindSplitCenterEvents() {
 
 /**
  * 加载分屏右栏：AI 助手面板
- * @param {number} jobId 目标岗位 ID
+ * @param {number|null} jobId 目标岗位 ID
+ * @param {{ containerId?: string, sessionKey?: string }} options
  */
-function loadSplitRightAssistant(jobId) {
-  const container = document.getElementById('splitRight');
+function loadSplitRightAssistant(jobId, options = {}) {
+  const containerId = options.containerId || 'splitRight';
+  const sessionKey = options.sessionKey || jobId;
+  const container = document.getElementById(containerId);
   if (!container) return;
 
   const providerOptions = Object.entries(AI_PROVIDER_DEFAULTS).map(
@@ -3955,7 +4022,7 @@ function loadSplitRightAssistant(jobId) {
   `;
 
   // 恢复历史消息
-  const savedMessages = loadAssistantSession(jobId);
+  const savedMessages = loadAssistantSession(sessionKey);
   if (savedMessages.length > 0) {
     aiConversationHistory = savedMessages;
     const msgContainer = document.getElementById('aiMessages');
@@ -3971,7 +4038,7 @@ function loadSplitRightAssistant(jobId) {
   }
 
   // 绑定 AI 助手事件
-  bindSplitRightAssistantEvents(jobId);
+  bindSplitRightAssistantEvents(jobId, { sessionKey });
   // 加载 AI 配置
   loadSplitAIConfig();
 
@@ -4090,18 +4157,11 @@ async function selectRecommendedJob(jobId, btnEl) {
   try {
     btnEl.disabled = true;
     btnEl.textContent = '⏳';
-    const resp = await fetch(`${window.__apiBase || 'http://127.0.0.1:7893'}/api/jobs/select`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ job_id: jobId, selected: true }),
-    });
-    if (resp.ok) {
-      btnEl.textContent = '✅';
-      btnEl.classList.add('selected');
-    } else {
-      btnEl.textContent = '❌';
-      btnEl.disabled = false;
-    }
+    await setFavoriteJob(jobId, true);
+    btnEl.textContent = '✅';
+    btnEl.classList.add('selected');
+    workspaceFavoriteCount += 1;
+    loadDeliveryList();
   } catch (e) {
     console.error('[推荐] 选中失败:', e);
     btnEl.textContent = '❌';
@@ -4121,18 +4181,15 @@ async function selectAllRecommendedJobs(btnEl) {
   btnEl.textContent = '⏳ 导入中...';
 
   let successCount = 0;
-  for (const id of jobIds) {
-    try {
-      const resp = await fetch(`${window.__apiBase || 'http://127.0.0.1:7893'}/api/jobs/select`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ job_id: id, selected: true }),
-      });
-      if (resp.ok) successCount++;
-    } catch (e) { /* continue */ }
+  try {
+    const result = await batchFavoriteJobs(jobIds, true);
+    successCount = Number(result.updated) || 0;
+  } catch (e) {
+    console.error('[推荐] 批量加入工作台失败:', e);
   }
 
   btnEl.textContent = `✅ 已导入 ${successCount}/${jobIds.length}`;
+  loadDeliveryList();
 
   cards.forEach(card => {
     const btn = card.querySelector('.recommend-select-btn');
@@ -4325,9 +4382,11 @@ function formatDeepThinkReply(dtData) {
 
 /**
  * 绑定 AI 助手面板的所有事件
- * @param {number} jobId 目标岗位 ID
+ * @param {number|null} jobId 目标岗位 ID
+ * @param {{ sessionKey?: string }} options
  */
-function bindSplitRightAssistantEvents(jobId) {
+function bindSplitRightAssistantEvents(jobId, options = {}) {
+  const sessionKey = options.sessionKey || jobId;
   const aiInput = document.getElementById('aiInput');
   const sendBtn = document.getElementById('sendBtn');
   const settingsBtn = document.getElementById('btn-ai-settings');
@@ -4375,7 +4434,7 @@ function shouldTriggerDeepThink(text, context) {
     addAIUserMessage(text);
     aiInput.value = '';
     aiConversationHistory.push({ role: 'user', text });
-    saveAssistantSession(jobId, aiConversationHistory);
+    saveAssistantSession(sessionKey, aiConversationHistory);
 
     showAITyping();
     if (sendBtn) sendBtn.disabled = true;
@@ -4406,12 +4465,30 @@ function shouldTriggerDeepThink(text, context) {
       } else {
         // SSE streaming with fallback
         const statusEl = document.querySelector('#aiStreamStatus');
+        let traceLines = [];
+        let traceTimer = null;
+        const renderTraceLog = () => {
+          if (!statusEl) return;
+          const latest = traceLines.slice(-8);
+          statusEl.innerHTML = latest.map(line => `<div class="ai-stream-line">${line}</div>`).join('');
+          statusEl.style.display = 'block';
+        };
         let pendingOps = [];
         try {
           data = await chatWithAIAssistantStream(jobId, text, aiConversationHistory, (event) => {
             if (statusEl && event.message) {
               statusEl.textContent = event.message;
               statusEl.style.display = 'block';
+            }
+            if (event.type === 'trace' && event.message) {
+              const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+              const extra = [];
+              if (event.tool) extra.push(`工具: ${event.tool}`);
+              if (event.file) extra.push(`文件: ${event.file}`);
+              traceLines.push(`[${ts}] ${event.message}${extra.length ? ` | ${extra.join(' | ')}` : ''}`);
+              if (traceTimer) clearTimeout(traceTimer);
+              renderTraceLog();
+              traceTimer = setTimeout(renderTraceLog, 50);
             }
             // 捕获推荐岗位进度
             if (event.type === 'tool' && event.tool === 'smart_job_recommend') {
@@ -4528,7 +4605,7 @@ function shouldTriggerDeepThink(text, context) {
       const progressEl = document.getElementById('aiRecommendProgress');
       if (progressEl) progressEl.remove();
       aiConversationHistory.push({ role: 'assistant', text: reply });
-      saveAssistantSession(jobId, aiConversationHistory);
+      saveAssistantSession(sessionKey, aiConversationHistory);
 
       // 处理 AI 修改简历的写回
       if (data.resume_updated) {
@@ -4630,7 +4707,7 @@ function shouldTriggerDeepThink(text, context) {
   if (clearChatBtn) {
     clearChatBtn.addEventListener('click', () => {
       aiConversationHistory = [];
-      clearAssistantSession(jobId);
+      clearAssistantSession(sessionKey);
       const aiMessages = document.getElementById('aiMessages');
       if (aiMessages) {
         aiMessages.innerHTML = `

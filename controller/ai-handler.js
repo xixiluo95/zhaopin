@@ -16,6 +16,7 @@ const { createActiveLLMClient } = require('./services/llm/llm-factory');
 const { createLLMClient } = require('./services/llm/llm-factory');
 const { parseResumeToMarkdown } = require('./services/resume-parser');
 const resumeDb = require('./resume-db');
+const jobsDb = require('./jobs-db');
 const { runDeepThink, resolveDeepThinkMode, validateDeepThinkConfig } = require('./services/ai/deep-think');
 
 const AI_BOOTSTRAP_DIR = process.env.ZHAOPIN_AI_BOOTSTRAP_DIR
@@ -69,12 +70,29 @@ const REFERENCE_TEXT_LIMIT = 3500;
 const PROJECT_SKILL_FILE = path.join(__dirname, '../SKILL.md');
 const ASSISTANT_MAX_TOOL_STEPS = 6;
 const ASSISTANT_SQL_ROW_LIMIT = 50;
+const CONTROLLER_BASE_URL = `http://127.0.0.1:${process.env.CONTROLLER_PORT || '7893'}`;
 
 function ensureFileDir(filePath) {
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
+}
+
+async function requestControllerJson(pathname, options = {}) {
+  const response = await fetch(`${CONTROLLER_BASE_URL}${pathname}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.headers || {})
+    }
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error || data.message || `Controller request failed: ${pathname}`);
+  }
+  return data;
 }
 
 function readAIBootstrapContext() {
@@ -334,122 +352,414 @@ function normalizeAssistantHistory(history) {
     .filter((item) => item.content);
 }
 
+const ASSISTANT_TOOL_SCHEMAS = [
+  {
+    name: 'get_tool_guide',
+    description: '读取某个工具的详细使用说明，做渐进式披露。',
+    parameters: {
+      type: 'object',
+      properties: {
+        tool_name: { type: 'string', description: '要查看说明的工具名' }
+      },
+      required: ['tool_name'],
+      additionalProperties: false
+    },
+    returns: '返回工具用途、参数、注意事项。'
+  },
+  {
+    name: 'get_system_map',
+    description: '读取系统入口地图，了解简历、岗位、数据库、爬虫、技能文档和联网工具从哪里进入。',
+    parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
+    returns: '返回系统入口、路径和使用建议。'
+  },
+  {
+    name: 'read_resume',
+    description: '读取当前最新简历的 Markdown、文件名、文件路径。',
+    parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
+    returns: '返回当前简历内容和元信息。'
+  },
+  {
+    name: 'read_current_job',
+    description: '读取当前岗位详情，包括职位描述、关键词、链接。',
+    parameters: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'number', description: '可选，不传则使用当前对话绑定的 job_id' }
+      },
+      required: [],
+      additionalProperties: false
+    },
+    returns: '返回岗位详情对象。'
+  },
+  {
+    name: 'list_selected_jobs',
+    description: '列出当前工作台卡片区中的岗位摘要，与收藏列表语义一致。',
+    parameters: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: '返回条数，默认 10，最大 20' }
+      },
+      required: [],
+      additionalProperties: false
+    },
+    returns: '返回工作台卡片区中的岗位列表。'
+  },
+  {
+    name: 'search_jobs_db',
+    description: '在本地职位库中按关键词搜索岗位。',
+    parameters: {
+      type: 'object',
+      properties: {
+        keyword: { type: 'string', description: '搜索关键词' },
+        limit: { type: 'number', description: '返回条数，默认 10，最大 20' }
+      },
+      required: ['keyword'],
+      additionalProperties: false
+    },
+    returns: '返回命中的岗位列表。'
+  },
+  {
+    name: 'query_database',
+    description: '对本地 SQLite 数据库执行只读 SELECT 查询。',
+    parameters: {
+      type: 'object',
+      properties: {
+        sql: { type: 'string', description: '只允许 SELECT / WITH / PRAGMA 的只读 SQL' }
+      },
+      required: ['sql'],
+      additionalProperties: false
+    },
+    returns: '返回 SQL 和结果行。'
+  },
+  {
+    name: 'enqueue_crawl_tasks',
+    description: '向后台采集队列追加批量搜索任务，让扩展在后台持续采集。',
+    parameters: {
+      type: 'object',
+      properties: {
+        cities: { type: 'array', items: { type: 'string' }, description: '城市数组，如 ["北京","上海"]' },
+        keywords: { type: 'array', items: { type: 'string' }, description: '关键词数组，如 ["产品经理","AI产品经理"]' },
+        source: { type: 'string', description: '任务来源，默认 ai_assistant' },
+        priority: { type: 'string', enum: ['normal', 'urgent', 'high'], description: '任务优先级' },
+        batch_id: { type: 'string', description: '批次号' },
+        delivery_target: { type: 'string', description: '可选投递目标' }
+      },
+      required: ['cities', 'keywords'],
+      additionalProperties: false
+    },
+    returns: '返回入队任务数和任务列表。'
+  },
+  {
+    name: 'get_crawl_queue_status',
+    description: '查询后台采集队列、最近结果和运行状态。',
+    parameters: {
+      type: 'object',
+      properties: {
+        recent_limit: { type: 'number', description: '最近结果条数，默认 10，最大 20' }
+      },
+      required: [],
+      additionalProperties: false
+    },
+    returns: '返回队列状态、任务队列和最近结果。'
+  },
+  {
+    name: 'update_resume',
+    description: '在用户明确要求时，直接更新当前简历内容。',
+    parameters: {
+      type: 'object',
+      properties: {
+        content_md: { type: 'string', description: '完整简历 Markdown' },
+        reason: { type: 'string', description: '更新原因' }
+      },
+      required: ['content_md'],
+      additionalProperties: false
+    },
+    returns: '返回是否更新成功和最新简历内容。'
+  },
+  {
+    name: 'update_resume_ops',
+    description: '用结构化操作修改简历局部内容，优先于整篇覆盖。',
+    parameters: {
+      type: 'object',
+      properties: {
+        ops: { type: 'array', items: { type: 'object' }, description: '结构化操作数组' },
+        reason: { type: 'string', description: '修改原因' },
+        change_summary: { type: 'object', description: '变更摘要' }
+      },
+      required: ['ops'],
+      additionalProperties: false
+    },
+    returns: '返回结构化变更信息，由前端实时应用。'
+  },
+  {
+    name: 'read_project_skill',
+    description: '读取项目的 SKILL.md，理解爬虫、插件和系统工作方式。',
+    parameters: {
+      type: 'object',
+      properties: {
+        skill_path: { type: 'string', description: '相对 ai-bootstrap 的技能文档路径' }
+      },
+      required: [],
+      additionalProperties: false
+    },
+    returns: '返回技能文档路径和内容摘要。'
+  },
+  {
+    name: 'fetch_url',
+    description: '抓取指定 URL 的网页正文文本。',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: '以 http/https 开头的 URL' }
+      },
+      required: ['url'],
+      additionalProperties: false
+    },
+    returns: '返回网页正文、状态码和内容类型。'
+  },
+  {
+    name: 'web_search',
+    description: '联网搜索公开网页信息，返回结果摘要。',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '搜索词' },
+        limit: { type: 'number', description: '返回条数，默认 5，最大 10' }
+      },
+      required: ['query'],
+      additionalProperties: false
+    },
+    returns: '返回搜索结果列表。'
+  },
+  {
+    name: 'smart_job_recommend',
+    description: '根据用户要求和简历，在数据库中自动筛选、评分、推荐匹配岗位。',
+    parameters: {
+      type: 'object',
+      properties: {
+        requirements: { type: 'string', description: '自然语言筛选要求' },
+        top_n: { type: 'number', description: '返回前 N 个岗位，默认 20' },
+        auto_select: { type: 'boolean', description: '是否自动加入工作台收藏列表' }
+      },
+      required: ['requirements'],
+      additionalProperties: false
+    },
+    returns: '返回筛选摘要和推荐岗位列表。'
+  },
+  {
+    name: 'collect_recent_jobs_to_workbench',
+    description: '按 SQL 的 crawled_at 时间筛选最近入库岗位，再结合简历做匹配并批量加入工作台收藏列表。',
+    parameters: {
+      type: 'object',
+      properties: {
+        requirements: { type: 'string', description: '自然语言筛选要求' },
+        within_hours: { type: 'number', description: '最近多少小时内入库，默认 24' },
+        top_n: { type: 'number', description: '最多加入工作台的岗位数，默认 50' }
+      },
+      required: ['requirements'],
+      additionalProperties: false
+    },
+    returns: '返回最近入库岗位的筛选摘要和加入工作台数量。'
+  },
+  {
+    name: 'batch_select_jobs',
+    description: '批量加入工作台：将岗位同时标记为已选中并加入收藏卡片区。',
+    parameters: {
+      type: 'object',
+      properties: {
+        job_ids: { type: 'array', items: { type: 'number' }, description: '岗位 ID 数组' }
+      },
+      required: ['job_ids'],
+      additionalProperties: false
+    },
+    returns: '返回实际加入工作台的数量。'
+  },
+  {
+    name: 'batch_deselect_jobs',
+    description: '批量移出工作台：将岗位从收藏卡片区移除（取消收藏）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        job_ids: { type: 'array', items: { type: 'number' }, description: '要移出的岗位 ID 数组' }
+      },
+      required: ['job_ids'],
+      additionalProperties: false
+    },
+    returns: '返回实际移出工作台的数量。'
+  },
+];
+
+function getAssistantToolSchemaMap() {
+  return ASSISTANT_TOOL_SCHEMAS.reduce((acc, schema) => {
+    acc[schema.name] = schema;
+    return acc;
+  }, {});
+}
+
+function describeToolParameter(paramName, schema) {
+  const type = schema?.type || 'any';
+  const enumText = Array.isArray(schema?.enum) && schema.enum.length > 0
+    ? `，可选值: ${schema.enum.join('/')}`
+    : '';
+  return `${paramName}: ${type}${enumText}${schema?.description ? `，${schema.description}` : ''}`;
+}
+
+function buildToolGuideFromSchema(schema) {
+  const properties = schema?.parameters?.properties || {};
+  const required = schema?.parameters?.required || [];
+  const argDescriptions = Object.keys(properties).reduce((acc, key) => {
+    acc[key] = describeToolParameter(key, properties[key]);
+    return acc;
+  }, {});
+
+  return {
+    purpose: schema.description,
+    args: argDescriptions,
+    required,
+    returns: schema.returns || '',
+    notes: [
+      required.length > 0 ? `必填参数: ${required.join(', ')}` : '该工具无必填参数。',
+      '参数必须满足工具 schema，不能随意传未定义字段。'
+    ]
+  };
+}
+
+function validateSchemaValue(value, schema, pathLabel) {
+  if (!schema) return;
+  const type = schema.type;
+
+  if (type === 'string' && typeof value !== 'string') {
+    throw new Error(`${pathLabel} 必须是 string`);
+  }
+  if (type === 'number' && (typeof value !== 'number' || Number.isNaN(value))) {
+    throw new Error(`${pathLabel} 必须是 number`);
+  }
+  if (type === 'boolean' && typeof value !== 'boolean') {
+    throw new Error(`${pathLabel} 必须是 boolean`);
+  }
+  if (type === 'array') {
+    if (!Array.isArray(value)) {
+      throw new Error(`${pathLabel} 必须是 array`);
+    }
+    if (schema.items) {
+      value.forEach((item, index) => validateSchemaValue(item, schema.items, `${pathLabel}[${index}]`));
+    }
+  }
+  if (type === 'object') {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new Error(`${pathLabel} 必须是 object`);
+    }
+  }
+  if (Array.isArray(schema.enum) && schema.enum.length > 0 && !schema.enum.includes(value)) {
+    throw new Error(`${pathLabel} 取值非法，允许值: ${schema.enum.join(', ')}`);
+  }
+}
+
+function validateAssistantToolArguments(toolName, args) {
+  const schema = getAssistantToolSchemaMap()[toolName];
+  if (!schema) {
+    throw new Error(`未知工具: ${toolName}`);
+  }
+
+  const payload = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+  const parameterSchema = schema.parameters || { type: 'object', properties: {}, required: [], additionalProperties: true };
+  const properties = parameterSchema.properties || {};
+  const required = parameterSchema.required || [];
+
+  for (const field of required) {
+    if (payload[field] === undefined) {
+      throw new Error(`${toolName}.${field} 是必填参数`);
+    }
+  }
+
+  if (parameterSchema.additionalProperties === false) {
+    for (const field of Object.keys(payload)) {
+      if (!properties[field]) {
+        throw new Error(`${toolName}.${field} 不是允许的参数`);
+      }
+    }
+  }
+
+  for (const [field, value] of Object.entries(payload)) {
+    validateSchemaValue(value, properties[field], `${toolName}.${field}`);
+  }
+
+  return payload;
+}
+
 function getAssistantToolCatalog() {
-  return [
-    { name: 'get_tool_guide', summary: '读取某个工具的详细使用说明，做渐进式披露。' },
-    { name: 'get_system_map', summary: '读取系统入口地图，了解简历、岗位、数据库、爬虫、技能文档和联网工具从哪里进入。' },
-    { name: 'read_resume', summary: '读取当前最新简历的 Markdown、文件名、文件路径。' },
-    { name: 'read_current_job', summary: '读取当前岗位详情，包括职位描述、关键词、链接。' },
-    { name: 'list_selected_jobs', summary: '列出当前已收藏/选中的岗位摘要。' },
-    { name: 'search_jobs_db', summary: '在本地职位库中按关键词搜索岗位。' },
-    { name: 'query_database', summary: '对本地 SQLite 数据库执行只读 SELECT 查询。' },
-    { name: 'update_resume', summary: '在用户明确要求时，直接更新当前简历内容。' },
-    { name: 'update_resume_ops', summary: '用结构化操作修改简历局部内容（优先使用此工具）。' },
-    { name: 'read_project_skill', summary: '读取项目的 SKILL.md，理解爬虫/插件入口与工作方式。' },
-    { name: 'fetch_url', summary: '抓取指定 URL 的网页正文文本。' },
-    { name: 'web_search', summary: '联网搜索公开网页信息，返回结果摘要。' },
-    { name: 'smart_job_recommend', summary: '智能岗位推荐：根据用户要求和简历，自动筛选、评分、推荐匹配的岗位。用户要求推荐/筛选/匹配岗位时必须使用此工具。' },
-    { name: 'batch_select_jobs', summary: '批量选中岗位：将推荐的岗位批量加入工作台（标记为已选中）。' },
-  ];
+  return ASSISTANT_TOOL_SCHEMAS.map((schema) => ({
+    name: schema.name,
+    summary: schema.description,
+    parameters: schema.parameters,
+  }));
 }
 
 function getAssistantToolGuide(toolName) {
-  const guides = {
-    get_tool_guide: {
-      purpose: '读取某个工具的详细说明，适合首次决定是否使用工具时。',
-      args: { tool_name: '工具名' },
-      notes: ['先读摘要，再按需展开，不要一上来把所有工具都调用一遍。']
-    },
-    get_system_map: {
-      purpose: '读取整个招聘工作台的关键入口地图。',
-      args: {},
-      notes: ['优先用它理解系统里有哪些可用入口，再决定是否读取 SKILL.md 或调用具体工具。']
-    },
-    read_resume: {
-      purpose: '读取当前最新简历，获取当前版本正文。',
-      args: {},
-      notes: ['修改前通常应先读一次。']
-    },
-    read_current_job: {
-      purpose: '读取当前对话绑定的岗位详情。',
-      args: { job_id: '可选，不传则用当前 job_id' },
-      notes: ['分析岗位匹配度、定向优化简历前优先使用。']
-    },
-    list_selected_jobs: {
-      purpose: '列出当前已收藏/选中的岗位。',
-      args: { limit: '可选，默认 10' },
-      notes: ['适合用户问“我收藏了哪些岗位”之类的问题。']
-    },
-    search_jobs_db: {
-      purpose: '在 scraped_jobs 本地职位库中搜索。',
-      args: { keyword: '关键词', limit: '可选，默认 10' },
-      notes: ['适合按公司、职位名、关键词搜岗位。']
-    },
-    query_database: {
-      purpose: '执行只读 SQL 查询。',
-      args: { sql: '只允许 SELECT / WITH / PRAGMA' },
-      notes: ['禁止 UPDATE/DELETE/INSERT/ATTACH/ALTER/DROP。结果会自动限流。']
-    },
-    update_resume: {
-      purpose: '直接更新当前简历 Markdown（整篇覆盖，仅作兜底）。',
-      args: { content_md: '完整 Markdown', reason: '更新原因' },
-      notes: ['优先使用 update_resume_ops 进行局部修改，仅在需要大幅重写整篇简历时使用此工具。']
-    },
-    update_resume_ops: {
-      purpose: '用结构化操作局部修改简历（推荐优先使用）。',
-      args: {
-        ops: '操作数组，每个操作格式: { tool: "操作名", args: {...} }',
-        reason: '修改原因',
-        change_summary: '{ changed_sections: ["工作经历"], changed_items_count: 3 }'
-      },
-      notes: [
-        '支持的操作: resume_set_field, resume_update_node, resume_insert_node, resume_delete_node, resume_move_node, resume_replace_text',
-        'resume_set_field: args: { field: "name|headline|meta.phone|meta.email|meta.location", value: "新值" }',
-        'resume_update_node: args: { sectionId: "sec-0", itemId: "item-0", text: "新内容" } 或 { sectionId: "sec-0", title: "新标题" }',
-        'resume_insert_node: args: { type: "section"|"item", title: "标题", afterSectionId: "sec-0", items: ["内容1","内容2"] }',
-        'resume_delete_node: args: { sectionId: "sec-0", itemId: "item-0" }（不传itemId则删整个section）',
-        'resume_move_node: args: { sectionId: "sec-0", direction: "up"|"down" }',
-        'resume_replace_text: args: { oldText: "旧文本", newText: "新文本" }',
-        '【头部保护】不要修改 name/meta 字段，除非用户明确要求。',
-        '每次修改后前端会实时预览变化。'
-      ]
-    },
-    read_project_skill: {
-      purpose: '读取项目根目录 SKILL.md 或子目录中的技能文档。',
-      args: { skill_path: '可选，相对于 ai-bootstrap 目录的路径，如 skills/resume-script-editor/SKILL.md' },
-      notes: ['适合用户问爬虫能力、系统结构、插件工作流、简历编辑工具用法。']
-    },
-    fetch_url: {
-      purpose: '抓取指定 URL 的网页文本。',
-      args: { url: 'http/https URL' },
-      notes: ['仅抓取用户请求相关页面；正文会截断。']
-    },
-    web_search: {
-      purpose: '搜索公开网页内容。',
-      args: { query: '搜索词', limit: '可选，默认 5' },
-      notes: ['返回的是搜索结果摘要，不是完整网页。']
-    },
-    smart_job_recommend: {
-      purpose: '根据用户的筛选要求和简历内容，智能推荐匹配岗位。会自动解析要求、提取简历画像、硬过滤、LLM打分。',
-      args: {
-        requirements: '用户的筛选要求，如"不要外包，薪资20k以上，前端岗位"',
-        top_n: '可选，返回前N个匹配岗位，默认20',
-        auto_select: '可选，是否自动将推荐岗位标记为已选（加入工作台），默认false'
-      },
-      notes: [
-        '当用户提到推荐/筛选/匹配/找工作/合适的岗位时，必须使用此工具。',
-        '支持自然语言要求：薪资范围、排除外包、城市限制、岗位方向等。',
-        '返回包含评分和匹配理由的岗位列表。'
-      ]
-    },
-    batch_select_jobs: {
-      purpose: '将指定岗位批量标记为已选中，加入工作台岗位列表。',
-      args: { job_ids: '岗位ID数组，如 [1, 5, 12, 23]' },
-      notes: ['配合 smart_job_recommend 使用，用户确认后批量导入推荐岗位。']
-    },
+  const schema = getAssistantToolSchemaMap()[toolName];
+  return schema ? buildToolGuideFromSchema(schema) : null;
+}
+
+function getAssistantOpenAITools() {
+  return ASSISTANT_TOOL_SCHEMAS.map((schema) => ({
+    type: 'function',
+    function: {
+      name: schema.name,
+      description: schema.description,
+      parameters: schema.parameters || { type: 'object', properties: {}, required: [], additionalProperties: false }
+    }
+  }));
+}
+
+function getToolExecutionMeta(toolName) {
+  const toolToFile = {
+    get_tool_guide: 'controller/ai-handler.js',
+    get_system_map: 'controller/ai-handler.js',
+    read_resume: 'controller/resume-db.js',
+    read_current_job: 'controller/ai-handler.js',
+    list_selected_jobs: 'controller/ai-handler.js',
+    search_jobs_db: 'controller/ai-handler.js',
+    query_database: 'controller/ai-handler.js',
+    enqueue_crawl_tasks: 'controller/ai-handler.js -> controller /enqueue',
+    get_crawl_queue_status: 'controller/ai-handler.js -> controller /status,/queue,/results',
+    update_resume: 'controller/resume-db.js',
+    update_resume_ops: 'controller/ai-handler.js',
+    read_project_skill: 'controller/ai-handler.js',
+    fetch_url: 'controller/ai-handler.js',
+    web_search: 'controller/ai-handler.js',
+    smart_job_recommend: 'controller/services/job-recommender.js',
+    batch_select_jobs: 'controller/jobs-db.js',
+    batch_deselect_jobs: 'controller/jobs-db.js',
   };
 
-  return guides[toolName] || null;
+  return {
+    tool: toolName,
+    file: toolToFile[toolName] || 'controller/ai-handler.js',
+  };
+}
+
+function summarizeToolResult(toolName, toolResult) {
+  if (!toolResult || typeof toolResult !== 'object') return '执行完成';
+  switch (toolName) {
+    case 'enqueue_crawl_tasks':
+      return `已入队 ${toolResult.queued || 0} 个后台任务`;
+    case 'get_crawl_queue_status':
+      return `队列长度 ${toolResult.status?.queueLength || 0}，运行中 ${toolResult.status?.runningCount || 0}`;
+    case 'smart_job_recommend':
+      return `扫描 ${toolResult.summary?.total_scanned || 0} 条，推荐 ${toolResult.summary?.recommended || 0} 条`;
+    case 'batch_select_jobs':
+      return `已加入工作台 ${toolResult.updated || 0} 条`;
+    case 'batch_deselect_jobs':
+      return `已移出工作台 ${toolResult.updated || 0} 条`;
+    case 'search_jobs_db':
+      return `命中 ${Array.isArray(toolResult.jobs) ? toolResult.jobs.length : 0} 条岗位`;
+    case 'list_selected_jobs':
+      return `当前工作台 ${Array.isArray(toolResult.jobs) ? toolResult.jobs.length : 0} 条`;
+    case 'query_database':
+      return `返回 ${Array.isArray(toolResult.rows) ? toolResult.rows.length : 0} 行`;
+    default:
+      return '执行完成';
+  }
 }
 
 function getAssistantSystemMap() {
@@ -515,7 +825,12 @@ function getAssistantSystemMap() {
 
 function buildAssistantSystemPrompt({ bootstrapContext, currentJobId }) {
   const toolCatalog = getAssistantToolCatalog()
-    .map((tool) => `- ${tool.name}: ${tool.summary}`)
+    .map((tool) => {
+      const required = tool.parameters?.required?.length
+        ? ` | required: ${tool.parameters.required.join(', ')}`
+        : '';
+      return `- ${tool.name}: ${tool.summary}${required}`;
+    })
     .join('\n');
 
   return [
@@ -528,9 +843,11 @@ function buildAssistantSystemPrompt({ bootstrapContext, currentJobId }) {
     '工具使用采用渐进式披露：先看下面的摘要；若要细化某个工具用法，先调用 get_tool_guide。',
     '如果用户明确要求优化、改写、修改简历，优先调用 update_resume_ops 进行局部结构化修改；仅在需要整篇重写时才使用 update_resume。',
     '如果用户只是咨询，不要修改简历。',
+    '如果用户要求后台搜索、批量采集、切页面后继续跑，优先使用 enqueue_crawl_tasks / get_crawl_queue_status，不要假装前端聊天就能持续执行页面脚本。',
     currentJobId ? `当前对话绑定岗位 ID: ${currentJobId}` : '当前没有绑定岗位 ID。',
     '你必须始终只输出 JSON，不允许输出 JSON 之外的自然语言。',
     '当需要工具时，输出：{"action":"tool_call","tool":"工具名","arguments":{...},"reason":"为什么需要这个工具"}',
+    'arguments 必须满足工具的函数签名：只传 schema 中定义的字段，字段类型必须正确。',
     '当准备回复用户时，输出：{"action":"respond","reply":"给用户看的回复","suggestions":["可选建议"],"resume_updated":true/false,"resume_updated_content_md":"若本轮改了简历则返回最新完整 Markdown，否则空字符串","memory_update":{"should_update":true/false,"reason":"为什么更新长期记忆","content_md":"完整长期记忆 Markdown 或空字符串"}}',
     '如果你已经通过 update_resume 修改了简历，最终 respond 时必须把 resume_updated 设为 true。',
     `## 岗位推荐触发规则（最高优先级）
@@ -542,13 +859,13 @@ function buildAssistantSystemPrompt({ bootstrapContext, currentJobId }) {
 - 帮我找/给我推荐/帮我筛选 + 工作/岗位
 - 合适的岗位/适合我的/匹配的工作
 - 把岗位加入工作台/放到工作台
+- 批量搜索/采集/抓取 + 岗位/职位
 
 检测到上述意图后的标准流程：
-1. 调用 smart_job_recommend，将用户的完整要求作为 requirements 参数
-2. 收到结果后，向用户展示推荐摘要（扫描数、过滤数、推荐数）
-3. 列出前几个推荐岗位的标题、公司、薪资、匹配分数和理由
-4. 询问用户是否将推荐岗位加入工作台
-5. 如果用户确认，调用 batch_select_jobs 批量标记`,
+1. 如果用户明确提到“搜索/采集/批量搜索/后台继续跑”，先调用 enqueue_crawl_tasks 建立后台任务
+2. 需要汇报后台状态时，再调用 get_crawl_queue_status
+3. 如果用户是在已有本地职位库里做推荐/筛选，再调用 smart_job_recommend
+4. 当用户明确要求“放到工作台/加入工作台”时，直接调用 batch_select_jobs，不要只改 selected 不改收藏`,
     `## 硬性约束
 1. 【最小修改原则】只修改用户明确要求的部分，不主动修改其他内容
 2. 【格式保持】保持原有Markdown格式和结构不变
@@ -725,12 +1042,390 @@ async function searchWeb(query, limit = 5) {
   };
 }
 
-async function executeAssistantTool({ db, toolName, args, currentJobId, resume }) {
+const DIRECT_CRAWL_CITY_DEFAULTS = ['北京', '上海', '杭州', '深圳'];
+const DIRECT_CRAWL_KEYWORD_DEFAULTS = [
+  '产品经理',
+  'AI产品经理',
+  '产品',
+  '产品运营'
+];
+
+function hasAnyKeyword(text, patterns) {
+  return patterns.some((pattern) => pattern.test(text));
+}
+
+function extractDirectCrawlYearsLimit(message) {
+  const text = String(message || '');
+  const match = text.match(/([0-9]+)\s*年(?:以下|以内|及以下)/);
+  if (match) {
+    return Number(match[1]);
+  }
+  if (/应届|校招|毕业两年内/.test(text)) {
+    return 2;
+  }
+  return null;
+}
+
+function extractDirectCrawlCities(message) {
+  const text = String(message || '');
+  const supportedCities = ['北京', '上海', '杭州', '深圳', '广州', '南京', '苏州', '成都', '武汉', '西安'];
+  const matches = supportedCities.filter((city) => text.includes(city));
+  return matches.length > 0 ? matches : DIRECT_CRAWL_CITY_DEFAULTS;
+}
+
+function extractDirectCrawlKeywords(message) {
+  const text = String(message || '');
+  const keywords = [];
+
+  if (/AI产品|人工智能产品|大模型产品|智能体产品|机器人产品/i.test(text)) {
+    keywords.push('AI产品经理');
+  }
+  if (/产品运营/.test(text)) {
+    keywords.push('产品运营');
+  }
+  if (/产品经理|产品岗位|产品岗/.test(text)) {
+    keywords.push('产品经理');
+  }
+  if (/产品\b/.test(text) || /产品/.test(text)) {
+    keywords.push('产品');
+  }
+
+  return [...new Set(keywords)].slice(0, 6).length > 0
+    ? [...new Set(keywords)].slice(0, 6)
+    : DIRECT_CRAWL_KEYWORD_DEFAULTS;
+}
+
+function extractRecentWindowHours(message) {
+  const text = String(message || '');
+  const dayMatch = text.match(/最近\s*([0-9]+)\s*天/);
+  if (dayMatch) {
+    return Math.max(1, Number(dayMatch[1]) * 24);
+  }
+  const hourMatch = text.match(/最近\s*([0-9]+)\s*(?:小时|个小时|h)/i);
+  if (hourMatch) {
+    return Math.max(1, Number(hourMatch[1]));
+  }
+  if (/今天|今日/.test(text)) return 24;
+  if (/最近|最新|新爬取|新抓取|新采集|刚爬取|刚抓取|刚采集/.test(text)) return 24;
+  return 24;
+}
+
+function detectDirectAssistantIntent(message) {
+  const text = String(message || '').trim();
+  if (!text) return null;
+
+  const wantsWorkbench = /工作台|卡片区|收藏列表|放到工作台|加入工作台/.test(text);
+  const recentCollectIntent = wantsWorkbench
+    && hasAnyKeyword(text, [/新爬取/, /新抓取/, /新采集/, /最近.*爬取/, /最新.*爬取/, /最近.*入库/, /最新.*入库/, /今天.*爬取/, /刚.*爬取/])
+    && hasAnyKeyword(text, [/收藏/, /加入/, /推送/, /放到/]);
+
+  if (recentCollectIntent) {
+    return {
+      type: 'recent_jobs_recommend_and_collect',
+      requirements: text,
+      within_hours: extractRecentWindowHours(text),
+    };
+  }
+
+  const localRecommendIntent = wantsWorkbench && hasAnyKeyword(text, [
+    /推荐/, /筛选/, /匹配/, /找/, /适合/, /可投递/, /可以投递/, /能投递/
+  ]) && hasAnyKeyword(text, [
+    /岗位/, /职位/, /工作/
+  ]);
+
+  if (localRecommendIntent) {
+    return {
+      type: 'local_recommend_and_collect',
+      requirements: text,
+    };
+  }
+
+  const crawlIntent = hasAnyKeyword(text, [
+    /批量搜索/, /批量采集/, /批量抓取/, /后台继续跑/, /继续跑/, /采集所有/, /搜索所有/
+  ]) && hasAnyKeyword(text, [
+    /岗位/, /职位/, /工作/
+  ]);
+
+  if (crawlIntent) {
+    return {
+      type: 'enqueue_crawl_tasks',
+      cities: extractDirectCrawlCities(text),
+      keywords: extractDirectCrawlKeywords(text),
+      yearsLimit: extractDirectCrawlYearsLimit(text),
+      wantsWorkbench: /工作台|卡片区|收藏列表|放到工作台|加入工作台/.test(text),
+    };
+  }
+
+  const statusIntent = hasAnyKeyword(text, [
+    /队列状态/, /采集状态/, /还在跑/, /是否在运行/, /运行状态/, /进度/, /排队/, /后台任务/
+  ]);
+
+  if (statusIntent) {
+    return {
+      type: 'get_crawl_queue_status',
+      recent_limit: 10,
+    };
+  }
+
+  return null;
+}
+
+async function handleDirectAssistantIntent({ db, intent, message, onProgress }) {
+  if (!intent) return null;
+
+  if (intent.type === 'recent_jobs_recommend_and_collect') {
+    onProgress?.({
+      type: 'trace',
+      message: '命中最近入库岗位收藏链路，将按 SQL 的 crawled_at 时间筛选。',
+      category: 'route',
+      file: 'controller/jobs-db.js',
+    });
+    onProgress?.({
+      type: 'phase',
+      message: '正在读取最近入库岗位...',
+    });
+
+    const toolResult = await executeAssistantTool({
+      db,
+      toolName: 'collect_recent_jobs_to_workbench',
+      args: {
+        requirements: intent.requirements,
+        within_hours: intent.within_hours,
+        top_n: 50,
+      },
+      currentJobId: null,
+      resume: null,
+    });
+
+    onProgress?.({
+      type: 'trace',
+      message: `最近 ${intent.within_hours} 小时内共扫描 ${toolResult.summary?.total_scanned || 0} 条，加入工作台 ${toolResult.collected?.updated || 0} 条。`,
+      category: 'result',
+      tool: 'collect_recent_jobs_to_workbench',
+      file: 'controller/jobs-db.js + controller/services/job-recommender.js',
+    });
+
+    return {
+      success: true,
+      reply: `已按最近 ${intent.within_hours} 小时入库的岗位做匹配，共扫描 ${toolResult.summary?.total_scanned || 0} 条，推荐 ${toolResult.summary?.recommended || 0} 条，加入工作台 ${toolResult.collected?.updated || 0} 条。`,
+      suggestions: [
+        '可继续让我只看今天新入库的岗位',
+        '可继续让我按薪资或城市进一步缩小范围'
+      ],
+      resume_updated: false,
+      resume_updated_content_md: '',
+      memory_update: { should_update: false, reason: '', content_md: '' },
+      tool_trace: [
+        { tool: 'collect_recent_jobs_to_workbench', reason: '命中最近入库岗位收藏链路，按 SQL 时间过滤后再匹配' }
+      ],
+      direct_intent: {
+        type: 'recent_jobs_recommend_and_collect',
+        within_hours: intent.within_hours,
+        summary: toolResult.summary || {},
+        collected: toolResult.collected || { updated: 0, total: 0 },
+        jobs: toolResult.jobs || [],
+      }
+    };
+  }
+
+  if (intent.type === 'local_recommend_and_collect') {
+    onProgress?.({
+      type: 'trace',
+      message: '命中库内筛选直达链路，跳过网站采集队列。',
+      category: 'route',
+      file: 'controller/ai-handler.js',
+    });
+    onProgress?.({
+      type: 'phase',
+      message: '正在读取简历和本地岗位库...',
+    });
+    const { recommendJobs } = require('./services/job-recommender');
+    const resume = resumeDb.getLatestResume();
+    if (!resume?.content_md) {
+      throw new Error('请先上传简历，再进行库内岗位筛选');
+    }
+
+    const llmClient = createActiveLLMClient(db);
+    if (!llmClient) {
+      throw new Error('请先配置 AI 提供商');
+    }
+
+    onProgress?.({
+      type: 'trace',
+      message: '使用 controller/services/job-recommender.js 执行数据库内筛选和并行评分。',
+      category: 'action',
+      file: 'controller/services/job-recommender.js',
+    });
+
+    const result = await recommendJobs({
+      userPrompt: intent.requirements,
+      resumeMd: resume.content_md,
+      db,
+      llmClient,
+      topN: 50,
+      onProgress,
+    });
+
+    const jobIds = (result.jobs || []).map((job) => Number(job.id)).filter((id) => Number.isInteger(id) && id > 0);
+    onProgress?.({
+      type: 'trace',
+      message: `数据库筛选完成：扫描 ${result.summary?.total_scanned || 0} 条，推荐 ${result.summary?.recommended || 0} 条。`,
+      category: 'result',
+      tool: 'smart_job_recommend',
+      file: 'controller/services/job-recommender.js',
+    });
+    onProgress?.({
+      type: 'phase',
+      message: '正在把推荐结果加入工作台...',
+    });
+    const collected = jobIds.length > 0 ? jobsDb.batchCollectToWorkbench(jobIds) : { updated: 0, total: 0 };
+    onProgress?.({
+      type: 'trace',
+      message: `已加入工作台 ${collected.updated} 条岗位。`,
+      category: 'result',
+      tool: 'batch_select_jobs',
+      file: 'controller/jobs-db.js',
+    });
+
+    return {
+      success: true,
+      reply: `已在数据库中完成并行筛选，共扫描 ${result.summary?.total_scanned || 0} 条岗位，硬过滤后 ${result.summary?.after_hard_filter || 0} 条，加入工作台 ${collected.updated} 条。`,
+      suggestions: [
+        '可继续让我缩小到指定城市或薪资范围',
+        '可继续让我查看这批岗位为什么被推荐'
+      ],
+      resume_updated: false,
+      resume_updated_content_md: '',
+      memory_update: { should_update: false, reason: '', content_md: '' },
+      tool_trace: [
+        { tool: 'smart_job_recommend', reason: '命中库内筛选硬路由，直接在数据库内推荐岗位' },
+        { tool: 'batch_select_jobs', reason: '将推荐岗位批量加入工作台收藏列表' }
+      ],
+      direct_intent: {
+        type: 'local_recommend_and_collect',
+        summary: result.summary || {},
+        collected,
+        jobs: result.jobs || [],
+      }
+    };
+  }
+
+  if (intent.type === 'enqueue_crawl_tasks') {
+    onProgress?.({
+      type: 'trace',
+      message: '命中后台采集直达链路，准备调用 controller /enqueue。',
+      category: 'route',
+      file: 'controller/ai-handler.js',
+    });
+    onProgress?.({
+      type: 'phase',
+      message: '正在创建后台采集任务...',
+    });
+    const batchId = `ai-batch-${Date.now()}`;
+    const toolResult = await executeAssistantTool({
+      db,
+      toolName: 'enqueue_crawl_tasks',
+      args: {
+        cities: intent.cities,
+        keywords: intent.keywords,
+        source: 'ai_assistant',
+        priority: 'urgent',
+        batch_id: batchId
+      },
+      currentJobId: null,
+      resume: null,
+    });
+    onProgress?.({
+      type: 'trace',
+      message: `已创建批次 ${batchId}，入队 ${toolResult.queued || 0} 个任务。`,
+      category: 'result',
+      tool: 'enqueue_crawl_tasks',
+      file: 'controller/ai-handler.js -> controller /enqueue',
+    });
+
+    const yearsText = intent.yearsLimit ? `${intent.yearsLimit}年以下` : '当前默认经验范围';
+    const workbenchText = intent.wantsWorkbench
+      ? '已先进入后台采集队列；工作台卡片区需要等采集结果入库后再加入。'
+      : '已进入后台采集队列。';
+
+    return {
+      success: true,
+      reply: `已创建后台采集任务 ${toolResult.queued} 个，批次 ${batchId}。范围：${intent.cities.join('、')}，关键词：${intent.keywords.join('、')}，经验要求按 ${yearsText} 执行。${workbenchText}`,
+      suggestions: [
+        '可继续让我查询这批任务的运行状态',
+        '如果要缩小范围，可以指定城市或关键词'
+      ],
+      resume_updated: false,
+      resume_updated_content_md: '',
+      memory_update: { should_update: false, reason: '', content_md: '' },
+      tool_trace: [
+        { tool: 'enqueue_crawl_tasks', reason: '命中批量采集硬路由，直接入后台队列' }
+      ],
+      direct_intent: {
+        type: 'enqueue_crawl_tasks',
+        batch_id: batchId,
+        queued: toolResult.queued,
+        tasks: toolResult.tasks || [],
+      }
+    };
+  }
+
+  if (intent.type === 'get_crawl_queue_status') {
+    onProgress?.({
+      type: 'trace',
+      message: '命中采集状态直达链路，准备读取 controller 状态。',
+      category: 'route',
+      file: 'controller/ai-handler.js',
+    });
+    const toolResult = await executeAssistantTool({
+      db,
+      toolName: 'get_crawl_queue_status',
+      args: { recent_limit: intent.recent_limit || 10 },
+      currentJobId: null,
+      resume: null,
+    });
+    onProgress?.({
+      type: 'trace',
+      message: `状态读取完成：队列 ${toolResult.status?.queueLength || 0}，运行中 ${toolResult.status?.runningCount || 0}。`,
+      category: 'result',
+      tool: 'get_crawl_queue_status',
+      file: 'controller/ai-handler.js -> controller /status,/queue,/results',
+    });
+
+    const status = toolResult.status || {};
+    return {
+      success: true,
+      reply: `当前队列长度 ${status.queueLength || 0}，运行中 ${status.runningCount || 0}，待处理 ${status.pendingCount || 0}，已完成 ${status.completedCount || 0}。`,
+      suggestions: [
+        '如果需要，我可以继续细看最近失败原因',
+        '如果需要，我可以继续检查这批任务是否由 AI 助手发起'
+      ],
+      resume_updated: false,
+      resume_updated_content_md: '',
+      memory_update: { should_update: false, reason: '', content_md: '' },
+      tool_trace: [
+        { tool: 'get_crawl_queue_status', reason: '命中采集状态硬路由，直接查询后台状态' }
+      ],
+      direct_intent: {
+        type: 'get_crawl_queue_status',
+        status: toolResult.status || {},
+        queue: toolResult.queue || {},
+        recent_results: toolResult.recent_results || [],
+      }
+    };
+  }
+
+  return null;
+}
+
+async function executeAssistantTool({ db, toolName, args, currentJobId, resume, onProgress = null }) {
+  const validatedArgs = validateAssistantToolArguments(toolName, args);
+
   switch (toolName) {
     case 'get_tool_guide': {
-      const guide = getAssistantToolGuide(args?.tool_name);
+      const guide = getAssistantToolGuide(validatedArgs?.tool_name);
       if (!guide) {
-        throw new Error(`未知工具说明: ${args?.tool_name || ''}`);
+        throw new Error(`未知工具说明: ${validatedArgs?.tool_name || ''}`);
       }
       return guide;
     }
@@ -750,21 +1445,21 @@ async function executeAssistantTool({ db, toolName, args, currentJobId, resume }
       };
     }
     case 'read_current_job': {
-      const job = getJobRecord(db, Number(args?.job_id) || currentJobId);
+      const job = getJobRecord(db, Number(validatedArgs?.job_id) || currentJobId);
       return {
         job: serializeJobRecord(job),
       };
     }
     case 'list_selected_jobs': {
-      const limit = Math.max(1, Math.min(Number(args?.limit) || 10, 20));
+      const limit = Math.max(1, Math.min(Number(validatedArgs?.limit) || 10, 20));
       const rows = db.prepare(
-        'SELECT id, title, company, location, salary, keywords FROM scraped_jobs WHERE selected = 1 ORDER BY id DESC LIMIT ?'
+        'SELECT id, title, company, location, salary, keywords FROM scraped_jobs WHERE is_favorite = 1 ORDER BY id DESC LIMIT ?'
       ).all(limit);
       return { jobs: rows };
     }
     case 'search_jobs_db': {
-      const keyword = String(args?.keyword || '').trim();
-      const limit = Math.max(1, Math.min(Number(args?.limit) || 10, 20));
+      const keyword = String(validatedArgs?.keyword || '').trim();
+      const limit = Math.max(1, Math.min(Number(validatedArgs?.limit) || 10, 20));
       const rows = db.prepare(`
         SELECT id, title, company, location, salary, keywords
         FROM scraped_jobs
@@ -775,13 +1470,66 @@ async function executeAssistantTool({ db, toolName, args, currentJobId, resume }
       return { keyword, jobs: rows };
     }
     case 'query_database': {
-      const sql = sanitizeSqlQuery(args?.sql);
+      const sql = sanitizeSqlQuery(validatedArgs?.sql);
       const rows = db.prepare(sql).all();
       return { sql, rows };
     }
+    case 'enqueue_crawl_tasks': {
+      const rawCities = Array.isArray(validatedArgs?.cities) ? validatedArgs.cities : [];
+      const rawKeywords = Array.isArray(validatedArgs?.keywords) ? validatedArgs.keywords : [];
+      const cities = rawCities.map((item) => String(item || '').trim()).filter(Boolean);
+      const keywords = rawKeywords.map((item) => String(item || '').trim()).filter(Boolean);
+      if (cities.length === 0 || keywords.length === 0) {
+        throw new Error('cities 和 keywords 都必须是非空数组');
+      }
+
+      const source = String(validatedArgs?.source || 'ai_assistant').trim() || 'ai_assistant';
+      const priority = String(validatedArgs?.priority || 'normal').trim() || 'normal';
+      const batchId = String(validatedArgs?.batch_id || '').trim() || null;
+      const deliveryTarget = String(validatedArgs?.delivery_target || '').trim() || null;
+
+      const tasks = [];
+      for (const city of cities) {
+        for (const keyword of keywords) {
+          const payload = { city, keyword, source, priority };
+          if (batchId) payload.batchId = batchId;
+          if (deliveryTarget) payload.deliveryTarget = deliveryTarget;
+          const result = await requestControllerJson('/enqueue', {
+            method: 'POST',
+            body: JSON.stringify(payload)
+          });
+          tasks.push({
+            taskId: result.taskId,
+            city,
+            keyword,
+            queueLength: result.queueLength || null
+          });
+        }
+      }
+
+      return {
+        success: true,
+        queued: tasks.length,
+        tasks,
+        background_run: true
+      };
+    }
+    case 'get_crawl_queue_status': {
+      const recentLimit = Math.max(1, Math.min(Number(validatedArgs?.recent_limit) || 10, 20));
+      const [status, queue, results] = await Promise.all([
+        requestControllerJson('/status'),
+        requestControllerJson('/queue', { method: 'GET' }),
+        requestControllerJson('/results', { method: 'GET' })
+      ]);
+      return {
+        status,
+        queue,
+        recent_results: Array.isArray(results) ? results.slice(-recentLimit) : []
+      };
+    }
     case 'update_resume': {
-      const contentMd = sanitizeAIResumeMarkdown(String(args?.content_md || '').trim());
-      const reason = String(args?.reason || '').trim();
+      const contentMd = sanitizeAIResumeMarkdown(String(validatedArgs?.content_md || '').trim());
+      const reason = String(validatedArgs?.reason || '').trim();
       if (!contentMd) {
         throw new Error('content_md 不能为空');
       }
@@ -797,9 +1545,9 @@ async function executeAssistantTool({ db, toolName, args, currentJobId, resume }
       };
     }
     case 'update_resume_ops': {
-      const ops = args?.ops;
-      const reason = String(args?.reason || '').trim();
-      const changeSummary = args?.change_summary || {};
+      const ops = validatedArgs?.ops;
+      const reason = String(validatedArgs?.reason || '').trim();
+      const changeSummary = validatedArgs?.change_summary || {};
       if (!Array.isArray(ops) || ops.length === 0) {
         throw new Error('ops 必须是非空数组');
       }
@@ -825,8 +1573,8 @@ async function executeAssistantTool({ db, toolName, args, currentJobId, resume }
     case 'read_project_skill': {
       // 支持读取子目录中的 skill 文件
       let skillPath = PROJECT_SKILL_FILE;
-      if (args?.skill_path) {
-        const resolved = path.resolve(AI_BOOTSTRAP_DIR, args.skill_path);
+      if (validatedArgs?.skill_path) {
+        const resolved = path.resolve(AI_BOOTSTRAP_DIR, validatedArgs.skill_path);
         // 安全检查：只允许读取 ai-bootstrap 目录下的文件
         if (resolved.startsWith(path.resolve(AI_BOOTSTRAP_DIR)) && fs.existsSync(resolved)) {
           skillPath = resolved;
@@ -845,16 +1593,16 @@ async function executeAssistantTool({ db, toolName, args, currentJobId, resume }
       };
     }
     case 'fetch_url': {
-      return await fetchUrlText(args?.url);
+      return await fetchUrlText(validatedArgs?.url);
     }
     case 'web_search': {
-      return await searchWeb(args?.query, Math.max(1, Math.min(Number(args?.limit) || 5, 10)));
+      return await searchWeb(validatedArgs?.query, Math.max(1, Math.min(Number(validatedArgs?.limit) || 5, 10)));
     }
     case 'smart_job_recommend': {
       const { recommendJobs } = require('./services/job-recommender');
       const resumeData = resume || resumeDb.getLatestResume();
       const resumeMd = resumeData?.content_md || '';
-      const requirements = String(args?.requirements || '').trim();
+      const requirements = String(validatedArgs?.requirements || '').trim();
       if (!requirements) throw new Error('请提供筛选要求');
       if (!resumeMd) throw new Error('请先上传简历');
 
@@ -864,33 +1612,84 @@ async function executeAssistantTool({ db, toolName, args, currentJobId, resume }
         resumeMd,
         db,
         llmClient,
-        topN: Number(args?.top_n) || 20,
+        topN: Number(validatedArgs?.top_n) || 20,
+        onProgress,
       });
 
-      // 如果用户要求自动选中
-      if (args?.auto_select && result.success && result.jobs.length > 0) {
-        const updateStmt = db.prepare('UPDATE scraped_jobs SET selected = 1 WHERE id = ?');
-        for (const job of result.jobs) {
-          updateStmt.run(job.id);
-        }
+      // 如果用户要求自动加入工作台
+      if (validatedArgs?.auto_select && result.success && result.jobs.length > 0) {
+        const ids = result.jobs.map((job) => job.id);
+        const collectResult = jobsDb.batchCollectToWorkbench(ids);
         result.auto_selected = true;
-        result.auto_selected_count = result.jobs.length;
+        result.auto_selected_count = collectResult.updated;
       }
 
       return result;
     }
+    case 'collect_recent_jobs_to_workbench': {
+      const { recommendJobs } = require('./services/job-recommender');
+      const resumeData = resume || resumeDb.getLatestResume();
+      const resumeMd = resumeData?.content_md || '';
+      const requirements = String(validatedArgs?.requirements || '').trim();
+      const withinHours = Math.max(1, Math.min(Number(validatedArgs?.within_hours) || 24, 24 * 30));
+      const topN = Math.max(1, Math.min(Number(validatedArgs?.top_n) || 50, 200));
+
+      if (!requirements) throw new Error('请提供筛选要求');
+      if (!resumeMd) throw new Error('请先上传简历');
+
+      const recentJobs = jobsDb.getRecentlyCrawledJobs(withinHours, 1000);
+      if (recentJobs.length === 0) {
+        return {
+          success: true,
+          summary: {
+            total_scanned: 0,
+            after_hard_filter: 0,
+            recommended: 0,
+            within_hours: withinHours,
+          },
+          collected: { updated: 0, total: 0 },
+          jobs: [],
+        };
+      }
+
+      const llmClient = createActiveLLMClient(db);
+      const result = await recommendJobs({
+        userPrompt: requirements,
+        resumeMd,
+        db,
+        llmClient,
+        topN,
+        candidateJobs: recentJobs,
+        onProgress,
+      });
+
+      const ids = (result.jobs || []).map((job) => job.id).filter(Boolean);
+      const collected = ids.length > 0 ? jobsDb.batchCollectToWorkbench(ids) : { updated: 0, total: 0 };
+
+      return {
+        ...result,
+        summary: {
+          ...(result.summary || {}),
+          within_hours: withinHours,
+        },
+        collected,
+      };
+    }
     case 'batch_select_jobs': {
-      const jobIds = args?.job_ids;
+      const jobIds = validatedArgs?.job_ids;
       if (!Array.isArray(jobIds) || jobIds.length === 0) {
         throw new Error('job_ids 必须是非空数组');
       }
-      const updateStmt = db.prepare('UPDATE scraped_jobs SET selected = 1 WHERE id = ?');
-      let updated = 0;
-      for (const id of jobIds) {
-        const r = updateStmt.run(Number(id));
-        if (r.changes > 0) updated++;
+      const collectResult = jobsDb.batchCollectToWorkbench(jobIds);
+      return { success: true, updated: collectResult.updated, total: collectResult.total };
+    }
+    case 'batch_deselect_jobs': {
+      const deselectIds = validatedArgs?.job_ids;
+      if (!Array.isArray(deselectIds) || deselectIds.length === 0) {
+        throw new Error('job_ids 必须是非空数组');
       }
-      return { success: true, updated, total: jobIds.length };
+      const result = jobsDb.batchSetFavorite(deselectIds, false);
+      return { success: true, updated: result.updated, total: result.total };
     }
     default:
       throw new Error(`未知工具: ${toolName}`);
@@ -901,14 +1700,65 @@ async function runAssistantLoop({ llmClient, systemPrompt, conversationHistory, 
   const messages = [{ role: 'system', content: systemPrompt }];
   messages.push(...conversationHistory);
   messages.push({ role: 'user', content: userMessage });
+  const nativeTools = typeof llmClient?.supportsNativeTools === 'function' && llmClient.supportsNativeTools()
+    ? getAssistantOpenAITools()
+    : null;
 
   let resumeUpdated = false;
   let latestResumeContent = resume?.content_md || '';
   const toolTrace = [];
 
   for (let step = 0; step < ASSISTANT_MAX_TOOL_STEPS; step += 1) {
-    const result = await llmClient.chat(messages);
+    const result = await llmClient.chat(messages, nativeTools ? { tools: nativeTools, toolChoice: 'auto' } : undefined);
     if (result.error || !result.content) {
+      if (!result.error && Array.isArray(result.toolCalls) && result.toolCalls.length > 0) {
+        // continue below
+      } else {
+        const errMsg = result.error?.message || 'AI 调用返回为空';
+        throw new Error(errMsg);
+      }
+    }
+
+    if (Array.isArray(result.toolCalls) && result.toolCalls.length > 0) {
+      for (const toolCall of result.toolCalls) {
+        const toolName = toolCall?.function?.name;
+        const rawArgs = toolCall?.function?.arguments || '{}';
+        const parsedArgs = extractJsonObject(rawArgs) || {};
+
+        const toolResult = await executeAssistantTool({
+          db,
+          toolName,
+          args: parsedArgs,
+          currentJobId,
+          resume,
+          onProgress: null,
+        });
+
+        if (toolResult?.resume_updated && toolResult?.content_md) {
+          resumeUpdated = true;
+          latestResumeContent = toolResult.content_md;
+        }
+
+        toolTrace.push({
+          tool: toolName,
+          reason: 'native_tool_call',
+        });
+
+        messages.push({
+          role: 'assistant',
+          content: result.content || '',
+        });
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          name: toolName,
+          content: JSON.stringify(toolResult),
+        });
+      }
+      continue;
+    }
+
+    if (!result.content) {
       const errMsg = result.error?.message || 'AI 调用返回为空';
       throw new Error(errMsg);
     }
@@ -932,6 +1782,7 @@ async function runAssistantLoop({ llmClient, systemPrompt, conversationHistory, 
         args: parsed.arguments || {},
         currentJobId,
         resume,
+        onProgress: null,
       });
 
       if (toolResult?.resume_updated && toolResult?.content_md) {
@@ -981,6 +1832,9 @@ async function runAssistantLoopWithProgress({ llmClient, systemPrompt, conversat
   const messages = [{ role: 'system', content: systemPrompt }];
   messages.push(...conversationHistory);
   messages.push({ role: 'user', content: userMessage });
+  const nativeTools = typeof llmClient?.supportsNativeTools === 'function' && llmClient.supportsNativeTools()
+    ? getAssistantOpenAITools()
+    : null;
 
   let resumeUpdated = false;
   let latestResumeContent = resume?.content_md || '';
@@ -988,13 +1842,126 @@ async function runAssistantLoopWithProgress({ llmClient, systemPrompt, conversat
   let collectedOps = [];
   let lastChangeSummary = {};
 
+  onProgress({
+    type: 'trace',
+    message: nativeTools
+      ? '已启用原生 function calling；模型可直接返回 tool calls。'
+      : '当前模型未启用原生 function calling，将使用 JSON 工具协议兜底。',
+    category: 'mode',
+  });
+
   for (let step = 0; step < ASSISTANT_MAX_TOOL_STEPS; step += 1) {
     if (step > 0) {
       onProgress({ type: 'phase', message: `第 ${step + 1} 轮思考...` });
     }
 
-    const result = await llmClient.chat(messages);
+    const result = await llmClient.chat(messages, nativeTools ? { tools: nativeTools, toolChoice: 'auto' } : undefined);
     if (result.error || !result.content) {
+      if (!result.error && Array.isArray(result.toolCalls) && result.toolCalls.length > 0) {
+        // continue below
+      } else {
+        const errMsg = result.error?.message || 'AI 调用返回为空';
+        throw new Error(errMsg);
+      }
+    }
+
+    if (Array.isArray(result.toolCalls) && result.toolCalls.length > 0) {
+      for (const toolCall of result.toolCalls) {
+        const toolName = toolCall?.function?.name;
+        const rawArgs = toolCall?.function?.arguments || '{}';
+        const parsedArgs = extractJsonObject(rawArgs) || {};
+        const toolMeta = getToolExecutionMeta(toolName);
+
+        onProgress({
+          type: 'trace',
+          message: `模型决定调用 ${toolName}`,
+          category: 'decision',
+          tool: toolName,
+          file: toolMeta.file,
+          arguments_preview: parsedArgs,
+        });
+
+        const TOOL_LABELS = {
+          read_resume: '📄 正在读取简历...',
+          read_current_job: '📋 正在读取岗位信息...',
+          update_resume: '✏️ 正在修改简历...',
+          update_resume_ops: '✏️ 正在局部修改简历...',
+          search_jobs_db: '🔍 正在搜索岗位...',
+          query_database: '🗃️ 正在查询数据...',
+          list_selected_jobs: '📌 正在读取收藏岗位...',
+          web_search: '🌐 正在搜索网络...',
+          fetch_url: '🔗 正在读取网页...',
+          enqueue_crawl_tasks: '🕸️ 正在加入后台采集队列...',
+          get_crawl_queue_status: '📡 正在读取采集状态...',
+          smart_job_recommend: '🎯 正在智能推荐岗位...',
+          batch_select_jobs: '📥 正在加入工作台...',
+          batch_deselect_jobs: '📤 正在移出工作台...',
+        };
+        onProgress({ type: 'tool', tool: toolName, message: TOOL_LABELS[toolName] || `🔧 正在执行 ${toolName}...` });
+
+        const toolResult = await executeAssistantTool({
+          db,
+          toolName,
+          args: parsedArgs,
+          currentJobId,
+          resume,
+          onProgress,
+        });
+
+        if (toolResult?.resume_updated && toolResult?.content_md) {
+          resumeUpdated = true;
+          latestResumeContent = toolResult.content_md;
+          onProgress({ type: 'resume_updated', message: '✅ 简历已更新' });
+        }
+
+        if (toolResult?.resume_updated && toolResult?.resume_ops) {
+          resumeUpdated = true;
+          collectedOps.push(...toolResult.resume_ops);
+          lastChangeSummary = toolResult.resume_change_summary || lastChangeSummary;
+          onProgress({
+            type: 'resume_ops_batch',
+            ops: toolResult.resume_ops,
+            change_summary: toolResult.resume_change_summary || {},
+          });
+          onProgress({ type: 'resume_updated', message: '✅ 简历局部更新' });
+        }
+
+        if (toolName === 'smart_job_recommend' && toolResult?.success && toolResult?.jobs) {
+          onProgress({
+            type: 'job_recommendations',
+            summary: toolResult.summary || {},
+            jobs: toolResult.jobs || [],
+          });
+        }
+
+        toolTrace.push({
+          tool: toolName,
+          reason: 'native_tool_call',
+        });
+
+        onProgress({
+          type: 'trace',
+          message: summarizeToolResult(toolName, toolResult),
+          category: 'result',
+          tool: toolName,
+          file: toolMeta.file,
+        });
+
+        messages.push({
+          role: 'assistant',
+          content: result.content || '',
+        });
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          name: toolName,
+          content: JSON.stringify(toolResult),
+        });
+      }
+      continue;
+    }
+
+    if (!result.content) {
       const errMsg = result.error?.message || 'AI 调用返回为空';
       throw new Error(errMsg);
     }
@@ -1013,6 +1980,7 @@ async function runAssistantLoopWithProgress({ llmClient, systemPrompt, conversat
 
     if (parsed.action === 'tool_call' && parsed.tool) {
       const toolName = parsed.tool;
+      const toolMeta = getToolExecutionMeta(toolName);
       const TOOL_LABELS = {
         read_resume: '📄 正在读取简历...',
         read_current_job: '📋 正在读取岗位信息...',
@@ -1023,8 +1991,20 @@ async function runAssistantLoopWithProgress({ llmClient, systemPrompt, conversat
         list_selected_jobs: '📌 正在读取收藏岗位...',
         web_search: '🌐 正在搜索网络...',
         fetch_url: '🔗 正在读取网页...',
+        enqueue_crawl_tasks: '🕸️ 正在加入后台采集队列...',
+        get_crawl_queue_status: '📡 正在读取采集状态...',
         smart_job_recommend: '🎯 正在智能推荐岗位...',
+        batch_select_jobs: '📥 正在加入工作台...',
+        batch_deselect_jobs: '📤 正在移出工作台...',
       };
+      onProgress({
+        type: 'trace',
+        message: `模型决定调用 ${toolName}`,
+        category: 'decision',
+        tool: toolName,
+        file: toolMeta.file,
+        arguments_preview: parsed.arguments || {},
+      });
       onProgress({ type: 'tool', tool: toolName, message: TOOL_LABELS[toolName] || `🔧 正在执行 ${toolName}...` });
 
       const toolResult = await executeAssistantTool({
@@ -1033,6 +2013,7 @@ async function runAssistantLoopWithProgress({ llmClient, systemPrompt, conversat
         args: parsed.arguments || {},
         currentJobId,
         resume,
+        onProgress,
       });
 
       if (toolResult?.resume_updated && toolResult?.content_md) {
@@ -1066,6 +2047,14 @@ async function runAssistantLoopWithProgress({ llmClient, systemPrompt, conversat
       toolTrace.push({
         tool: toolName,
         reason: String(parsed.reason || '').trim(),
+      });
+
+      onProgress({
+        type: 'trace',
+        message: summarizeToolResult(toolName, toolResult),
+        category: 'result',
+        tool: toolName,
+        file: toolMeta.file,
       });
 
       messages.push({ role: 'assistant', content: JSON.stringify(parsed) });
@@ -1472,6 +2461,23 @@ async function handleAssistantChat(req, res) {
 
       const currentJobId = Number(body.job_id) || null;
       const resume = resumeDb.getLatestResume();
+      const directIntent = detectDirectAssistantIntent(message);
+      const directResult = await handleDirectAssistantIntent({ db, intent: directIntent, message });
+      if (directResult) {
+        res.end(JSON.stringify({
+          success: true,
+          reply: sanitizeReply(directResult.reply),
+          suggestions: directResult.suggestions,
+          resume_updated: false,
+          resume_updated_content_md: '',
+          memory_updated: false,
+          memory_update_reason: '',
+          tool_trace: directResult.tool_trace,
+          direct_intent: directResult.direct_intent,
+        }));
+        return;
+      }
+
       const bootstrapContext = readAIBootstrapContext();
 
       // Auto-preread: inject resume + job into system prompt to avoid tool_call rounds
@@ -1559,13 +2565,62 @@ async function handleAssistantChatStream(req, res) {
         'Connection': 'keep-alive',
         'Access-Control-Allow-Origin': '*',
       });
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+      }
 
       const sendEvent = (type, data) => {
         res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
       };
+      res.write(': connected\n\n');
 
       const currentJobId = Number(body.job_id) || null;
       const resume = resumeDb.getLatestResume();
+      const directIntent = detectDirectAssistantIntent(message);
+      if (directIntent) {
+        sendEvent('trace', {
+          message: `命中直接意图路由: ${directIntent.type}`,
+          category: 'route',
+          file: 'controller/ai-handler.js',
+        });
+      }
+      const directResult = await handleDirectAssistantIntent({
+        db,
+        intent: directIntent,
+        message,
+        onProgress: (event) => sendEvent(event.type, event),
+      });
+      if (directResult) {
+        sendEvent('phase', { message: '命中直接执行路由...' });
+        if (directResult.direct_intent?.type === 'enqueue_crawl_tasks') {
+          sendEvent('trace', {
+            message: `使用 controller /enqueue 创建后台任务，批次 ${directResult.direct_intent.batch_id}`,
+            category: 'action',
+            file: 'controller/ai-handler.js -> controller /enqueue',
+          });
+        }
+        if (directResult.direct_intent?.type === 'local_recommend_and_collect') {
+          sendEvent('trace', {
+            message: '使用数据库内推荐链路，不触发网站并行抓取',
+            category: 'action',
+            file: 'controller/services/job-recommender.js',
+          });
+        }
+        sendEvent('done', {
+          success: true,
+          reply: sanitizeReply(directResult.reply),
+          suggestions: directResult.suggestions,
+          resume_updated: false,
+          resume_updated_content_md: '',
+          memory_updated: false,
+          memory_update_reason: '',
+          tool_trace: directResult.tool_trace,
+          direct_intent: directResult.direct_intent,
+        });
+        res.end();
+        return;
+      }
+
       const bootstrapContext = readAIBootstrapContext();
       const systemPrompt = buildAssistantSystemPrompt({ bootstrapContext, currentJobId });
 
@@ -1587,6 +2642,11 @@ async function handleAssistantChatStream(req, res) {
       const conversationHistory = normalizeAssistantHistory(body.conversation_history);
 
       sendEvent('phase', { message: '正在思考...' });
+      sendEvent('trace', {
+        message: '进入标准 assistant loop，开始判断是否需要工具调用。',
+        category: 'route',
+        file: 'controller/ai-handler.js',
+      });
 
       const assistantResult = await runAssistantLoopWithProgress({
         llmClient,
@@ -1688,9 +2748,9 @@ async function handleJobMatch(req, res) {
           `SELECT id, title, company, raw_payload FROM scraped_jobs WHERE id IN (${placeholders})`
         ).all(...body.job_ids);
       } else {
-        // 默认获取所有已选中的岗位
+        // 默认获取所有已加入工作台卡片区的岗位
         jobs = db.prepare(
-          'SELECT id, title, company, raw_payload FROM scraped_jobs WHERE selected = 1'
+          'SELECT id, title, company, raw_payload FROM scraped_jobs WHERE is_favorite = 1'
         ).all();
       }
 

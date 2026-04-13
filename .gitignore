@@ -119,6 +119,10 @@ MULTI_PLATFORM_PHASE_PRD.md
 # Uploads and data
 controller/uploads/
 controller/.native_host_state.json
+controller/services/data/
+controller/logs/
+crawler/extension/logs/
+logs/
 
 # Documentation text files (keep only screenshots)
 docs/**/*.md

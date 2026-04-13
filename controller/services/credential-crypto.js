@@ -15,8 +15,11 @@ const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 12;   // GCM 推荐 12 字节 IV
 const AUTH_TAG_LENGTH = 16;
 
-// 加密密钥：生产环境必须通过环境变量注入，开发环境使用默认值
-const KEY = process.env.CREDENTIAL_ENCRYPTION_KEY || 'dev-key-32bytes-long-default!!!!';
+// 加密密钥：必须通过环境变量 CREDENTIAL_ENCRYPTION_KEY 注入（32字节）
+const KEY = process.env.CREDENTIAL_ENCRYPTION_KEY || (() => {
+  console.warn('[credential-crypto] 警告: 未设置 CREDENTIAL_ENCRYPTION_KEY 环境变量，使用临时开发密钥');
+  return 'dev-only-insecure-key-replace-me-!!';
+})();
 
 // 确保 KEY 恰好 32 字节（AES-256 要求）
 function _getKeyBuffer() {

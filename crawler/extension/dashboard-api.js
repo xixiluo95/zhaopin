@@ -169,6 +169,32 @@ export async function favoriteJob(id) {
 }
 
 /**
+ * 显式设置单个岗位收藏状态（幂等）
+ * @param {number} id 职位 ID
+ * @param {boolean} isFavorite 是否收藏
+ */
+export async function setFavoriteJob(id, isFavorite = true) {
+  return request('/api/jobs/favorite', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, isFavorite }),
+  });
+}
+
+/**
+ * 批量设置岗位收藏状态（幂等）
+ * @param {number[]} ids 职位 ID 数组
+ * @param {boolean} isFavorite 是否收藏
+ */
+export async function batchFavoriteJobs(ids, isFavorite = true) {
+  return request('/api/jobs/favorite', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids, isFavorite }),
+  });
+}
+
+/**
  * 清空全部岗位数据
  */
 export async function clearAllJobs() {

@@ -140,6 +140,55 @@ function handleToggleFavorite(req, res) {
 }
 
 /**
+ * POST /api/jobs/favorite - 显式设置收藏状态（支持单个/批量）
+ * body:
+ *   { id: number, isFavorite: boolean }
+ *   或 { ids: number[], isFavorite: boolean }
+ */
+function handleSetFavorite(req, res) {
+  let body = '';
+  req.on('data', (chunk) => { body += chunk; });
+  req.on('end', () => {
+    try {
+      const payload = JSON.parse(body || '{}');
+      const isFavorite = payload.isFavorite !== false;
+
+      if (Array.isArray(payload.ids)) {
+        const ids = payload.ids.map((item) => Number(item)).filter((id) => Number.isInteger(id) && id > 0);
+        if (ids.length === 0) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Missing or invalid ids' }));
+          return;
+        }
+
+        const result = jobsDb.batchSetFavorite(ids, isFavorite);
+        res.end(JSON.stringify({ success: true, updated: result.updated, total: result.total, isFavorite }));
+        return;
+      }
+
+      const id = Number(payload.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Missing or invalid id' }));
+        return;
+      }
+
+      const result = jobsDb.setFavorite(id, isFavorite);
+      if (!result) {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: 'Job not found' }));
+        return;
+      }
+
+      res.end(JSON.stringify({ success: true, id, isFavorite: result.isFavorite }));
+    } catch (e) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Invalid JSON' }));
+    }
+  });
+}
+
+/**
  * POST /api/jobs/clear - 清空全部岗位
  */
 function handleClearAllJobs(req, res) {
@@ -311,6 +360,7 @@ module.exports = {
   handleSelectJob,
   handleGetDeliveryList,
   handleToggleFavorite,
+  handleSetFavorite,
   handleClearAllJobs,
   handleBatchInsert,
   handleGetDetailBacklog,
