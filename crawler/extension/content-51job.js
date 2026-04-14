@@ -695,6 +695,10 @@
         handleOpenJobDetailFromList(request, sendResponse);
         break;
 
+      case 'WAIT_FOR_JOB_LIST_READY':
+        handleWaitForJobListReady(request, sendResponse);
+        break;
+
       default:
         sendResponse({ success: false, error: '未知消息类型' });
     }
@@ -830,6 +834,57 @@
       isSearchPage: window.location.hostname === 'search.51job.com' || window.location.hostname === 'we.51job.com',
       isDetailPage: window.location.hostname === 'jobs.51job.com'
     });
+  }
+
+  /**
+   * 等待职位列表渲染完成（业务级就绪判定）
+   * SPA 页面壳 ready 不等于职位列表 ready，必须轮询到 .joblist-item 出现且字段可读
+   *
+   * 就绪条件：
+   *   1. .joblist-item 数量 > 0
+   *   2. 第一个卡片内 .jname 文本非空
+   *
+   * @param {Object} request - { timeoutMs?: number } 默认 15000ms
+   */
+  async function handleWaitForJobListReady(request, sendResponse) {
+    var timeoutMs = request.timeoutMs || 15000;
+    var started = Date.now();
+
+    function check() {
+      var cards = document.querySelectorAll('.joblist-item');
+      if (cards.length > 0) {
+        var firstName = cards[0].querySelector('.jname, .jobname, .jname.at');
+        if (firstName && safeText(firstName)) {
+          return { ready: true, count: cards.length };
+        }
+      }
+      return null;
+    }
+
+    var result = check();
+    if (result) {
+      console.log('[51jobScraper] 职位列表已就绪: ' + result.count + ' 条');
+      sendResponse({ success: true, ready: true, count: result.count });
+      return;
+    }
+
+    // 轮询等待
+    var interval = 500;
+    function poll() {
+      if (Date.now() - started > timeoutMs) {
+        console.warn('[51jobScraper] 职位列表等待超时 (' + timeoutMs + 'ms)');
+        sendResponse({ success: false, ready: false, error: '职位列表渲染超时' });
+        return;
+      }
+      var r = check();
+      if (r) {
+        console.log('[51jobScraper] 职位列表就绪 (轮询): ' + r.count + ' 条, 耗时 ' + (Date.now() - started) + 'ms');
+        sendResponse({ success: true, ready: true, count: r.count });
+        return;
+      }
+      setTimeout(poll, interval);
+    }
+    setTimeout(poll, interval);
   }
 
   function parseSensorsDataFromNode(node) {

@@ -3422,7 +3422,22 @@ class JobHunterService {
             const tab = await this.createTabWithRetry({ url: baseUrl, active: false });
             sharedTabId = tab.id;
             console.log(`[51job] 打开标签页 ${sharedTabId}: ${city.name} - ${keyword} - p1`);
-            await this.sleep(5000);
+
+            // Layer 1: 基础握手 — 等待页面加载 + Content Script 就绪
+            await this.waitForTabLoad(sharedTabId);
+            await this.waitForContentScript(sharedTabId);
+
+            // Layer 2: 业务级就绪 — 等待职位列表渲染完成
+            console.log(`[51job] 等待职位列表渲染...`);
+            const readyResult = await this.sendTabMessageWithRetry(sharedTabId, {
+              type: 'WAIT_FOR_JOB_LIST_READY',
+              timeoutMs: 15000
+            });
+            if (!readyResult || !readyResult.success) {
+              console.warn(`[51job] 职位列表未就绪: ${readyResult?.error || '无响应'}`);
+            } else {
+              console.log(`[51job] 职位列表已就绪: ${readyResult.count} 条`);
+            }
           } else {
             // p2+: 在同一个 tab 内通过 content script 点击翻页
             console.log(`[51job] 页内翻页: ${city.name} - ${keyword} - p${pageNum}`);

@@ -1191,8 +1191,35 @@ let currentResume = null;          // 当前简历数据对象
 let currentResumeMode = 'view';    // 'view' | 'edit'
 let aiConfigured = false;          // AI 是否已配置
 let currentResumeDraftMd = '';     // 稳定简历草稿源，模板切换不修改此变量
-let aiConversationHistory = [];    // AI 助手对话历史
+let aiConversationHistory = [];    // AI 助手对话历史（split view 使用）
 let workspaceAssistantVisible = false;
+
+/* ==================== Workspace AI 助手状态（唯一真相） ==================== */
+const wsAssistant = {
+  mounted: false,
+  sessionKey: 'workspace-main',
+  activeRequestId: null,    // 防止旧请求覆盖新状态
+
+  // 运行态
+  phase: 'idle',            // idle | streaming | deep_think | done | error
+  running: false,
+  sendBtnDisabled: false,
+
+  // 消息（唯一真相）
+  // 每条: { id, role: 'user'|'assistant'|'system', text, timestamp, status: 'done'|'streaming' }
+  messages: [],
+
+  // 流式追踪（仅对 status='streaming' 的那条 message）
+  streamingMsgId: null,
+
+  // 调试/进度
+  streamStatusLines: [],    // trace 日志（最多 20 条）
+  recommendProgress: false,
+
+  // 脏标记
+  dirtyFavorites: false,
+  dirtyResume: false,
+};
 let workspaceFavoriteCount = 0;
 const RESUME_TEMPLATE_STORAGE_KEY = 'jobhunter_resume_template';
 const RESUME_TEMPLATE_OPTIONS = [
@@ -1717,12 +1744,176 @@ function applyWorkspaceLayoutState() {
   btn.classList.toggle('is-active', workspaceAssistantVisible);
 
   if (workspaceAssistantVisible) {
-    loadSplitRightAssistant(null, {
-      containerId: 'ws-ai-content',
-      sessionKey: 'workspace-main'
-    });
+    if (!wsAssistant.mounted) {
+      mountWorkspaceAssistant(aiContainer);
+    }
+    // 从 state 恢复渲染（不重建面板）
+    renderWorkspaceAssistant();
+    // 恢复按钮/输入状态
+    const sendBtn = document.getElementById('sendBtn');
+    if (sendBtn) sendBtn.disabled = wsAssistant.sendBtnDisabled;
+    const aiInput = document.getElementById('aiInput');
+    if (aiInput && wsAssistant.running) aiInput.disabled = false;
+  }
+}
+
+/** workspace AI 助手首次挂载（只执行一次） */
+function mountWorkspaceAssistant(container) {
+  container.innerHTML = buildAssistantPanelShell({ mode: 'workspace' });
+  wsAssistant.mounted = true;
+
+  // 恢复历史消息到 state
+  const saved = loadAssistantSession(wsAssistant.sessionKey);
+  if (saved.length > 0) {
+    wsAssistant.messages = saved.map((m, i) => ({
+      id: Date.now() + i,
+      role: m.role,
+      text: m.text,
+      timestamp: getAIChatTime(),
+      status: 'done',
+    }));
   } else {
-    aiContainer.innerHTML = '';
+    wsAssistant.messages = [{
+      id: 1,
+      role: 'assistant',
+      text: '你好！我是你的简历优化助手。\n你可以发送消息让我帮你优化简历、分析岗位匹配度，或者直接提问。',
+      timestamp: getAIChatTime(),
+      status: 'done',
+    }];
+  }
+
+  // 绑定事件（只绑一次）
+  bindWorkspaceAssistantEvents();
+
+  // 加载 AI 配置 + 能力探测
+  loadSplitAIConfig();
+  getAICapabilities().then(caps => {
+    const dtToggle = document.getElementById('sp-dt-toggle');
+    if (dtToggle) dtToggle.disabled = !caps.deep_think;
+    window.__aiCapabilities = caps;
+  }).catch(() => {
+    window.__aiCapabilities = { assistant_chat: true, deep_think: false };
+  });
+}
+
+/** workspace AI 助手事件绑定（只执行一次） */
+function bindWorkspaceAssistantEvents() {
+  const sendBtn = document.getElementById('sendBtn');
+  const aiInput = document.getElementById('aiInput');
+  const settingsBtn = document.getElementById('btn-ai-settings');
+  const closeSettingsBtn = document.getElementById('btn-close-settings');
+  const clearChatBtn = document.getElementById('btn-clear-chat');
+  const settingsPanel = document.getElementById('aiSettingsPanel');
+  const aiSaveBtn = document.getElementById('sp-ai-save-btn');
+  const spProvider = document.getElementById('sp-ai-provider');
+
+  // 发送 → 顶层 sendAIMessage（带防重入）
+  if (sendBtn) sendBtn.addEventListener('click', () => sendAIMessage());
+  if (aiInput) {
+    aiInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); sendAIMessage(); }
+    });
+  }
+
+  // 设置面板切换
+  if (settingsBtn) settingsBtn.addEventListener('click', () => { if (settingsPanel) settingsPanel.classList.toggle('is-open'); });
+  if (closeSettingsBtn) closeSettingsBtn.addEventListener('click', () => { if (settingsPanel) settingsPanel.classList.remove('is-open'); });
+
+  // 清空对话
+  if (clearChatBtn) {
+    clearChatBtn.addEventListener('click', () => {
+      wsAssistant.messages = [{
+        id: Date.now(),
+        role: 'assistant',
+        text: '对话已清空。有什么可以帮你的吗？',
+        timestamp: getAIChatTime(),
+        status: 'done',
+      }];
+      wsAssistant.streamStatusLines = [];
+      wsAssistant.recommendProgress = false;
+      clearAssistantSession(wsAssistant.sessionKey);
+      scheduleAssistantRender(true);
+    });
+  }
+
+  // AI Provider 切换
+  if (spProvider) {
+    spProvider.addEventListener('change', () => {
+      const provider = spProvider.value;
+      const defaults = AI_PROVIDER_DEFAULTS[provider];
+      if (!defaults) return;
+      const baseUrlInput = document.getElementById('sp-ai-base-url');
+      const modelInput = document.getElementById('sp-ai-model');
+      if (baseUrlInput) baseUrlInput.value = defaults.base_url;
+      if (modelInput) modelInput.value = defaults.model;
+    });
+  }
+
+  // AI 配置保存按钮
+  if (aiSaveBtn) {
+    aiSaveBtn.addEventListener('click', async () => {
+      const provider = document.getElementById('sp-ai-provider')?.value;
+      const apiKey = document.getElementById('sp-ai-api-key')?.value.trim();
+      const baseUrl = document.getElementById('sp-ai-base-url')?.value.trim();
+      const model = document.getElementById('sp-ai-model')?.value.trim();
+      if (!apiKey) { showToast('请输入 API Key', 'error'); return; }
+      if (!baseUrl) { showToast('请输入 Base URL', 'error'); return; }
+      if (!model) { showToast('请输入模型名称', 'error'); return; }
+      aiSaveBtn.disabled = true;
+      aiSaveBtn.textContent = '保存中...';
+      try {
+        await saveAIConfig({ provider, api_key: apiKey, base_url: baseUrl, model_name: model });
+        showToast('AI 配置已保存', 'success');
+        aiConfigured = true;
+        loadInlineAIConfig();
+      } catch (err) {
+        showToast('保存 AI 配置失败: ' + err.message, 'error');
+      } finally {
+        aiSaveBtn.disabled = false;
+        aiSaveBtn.textContent = '保存配置';
+      }
+    });
+  }
+
+  // 深度思考开关
+  const spDtToggle = document.getElementById('sp-dt-toggle');
+  if (spDtToggle) {
+    spDtToggle.addEventListener('change', async () => {
+      try {
+        await saveDeepThinkConfig({ enabled: spDtToggle.checked });
+        showToast(spDtToggle.checked ? '深度思考已开启' : '深度思考已关闭', 'success');
+      } catch (err) {
+        showToast('保存深度思考配置失败: ' + err.message, 'error');
+        spDtToggle.checked = !spDtToggle.checked;
+      }
+    });
+  }
+
+  // 第二模型折叠 + 保存
+  const spSecToggle = document.getElementById('sp-sec-model-toggle');
+  const spSecBody = document.getElementById('sp-sec-model-body');
+  if (spSecToggle && spSecBody) {
+    spSecToggle.addEventListener('click', () => {
+      const open = spSecBody.style.display !== 'none';
+      spSecBody.style.display = open ? 'none' : '';
+      spSecToggle.textContent = (open ? '▶' : '▼') + ' 第二模型配置';
+    });
+  }
+  const spSecSaveBtn = document.getElementById('sp-sec-save-btn');
+  if (spSecSaveBtn) {
+    spSecSaveBtn.addEventListener('click', async () => {
+      await handleSecondaryModelSave('sp');
+    });
+  }
+
+  // 文件上传（静默）
+  const fileUpload = document.getElementById('aiFileUpload');
+  if (fileUpload) {
+    fileUpload.addEventListener('change', (e) => {
+      if (e.target.files && e.target.files.length > 0) {
+        showToast(`已选择 ${e.target.files.length} 个文件`, 'info');
+      }
+    });
   }
 }
 
@@ -3920,17 +4111,35 @@ function bindSplitCenterEvents() {
  * @param {number|null} jobId 目标岗位 ID
  * @param {{ containerId?: string, sessionKey?: string }} options
  */
-function loadSplitRightAssistant(jobId, options = {}) {
-  const containerId = options.containerId || 'splitRight';
-  const sessionKey = options.sessionKey || jobId;
-  const container = document.getElementById(containerId);
-  if (!container) return;
-
+/**
+ * 构建 AI 助手面板 HTML 骨架（workspace 和 split view 共用）
+ * @param {{ mode?: 'workspace' | 'split' }} options
+ * @returns {string}
+ */
+function buildAssistantPanelShell({ mode = 'workspace' } = {}) {
   const providerOptions = Object.entries(AI_PROVIDER_DEFAULTS).map(
     ([key, val]) => `<option value="${key}">${val.label}</option>`
   ).join('');
 
-  container.innerHTML = `
+  const welcomeText = mode === 'workspace'
+    ? ''  // workspace 模式下欢迎语由 state 驱动，不写死在模板里
+    : `<div class="message ai">
+        <div class="message-avatar ai-avatar">🤖</div>
+        <div class="message-body">
+          <div class="message-meta">
+            <span class="message-sender">AI 助手</span>
+            <span class="message-time">${getAIChatTime()}</span>
+          </div>
+          <div class="message-bubble">
+            <div class="message-text">
+              你好！我是你的简历优化助手。<br>
+              你可以发送消息让我帮你优化简历、分析岗位匹配度，或者直接提问。
+            </div>
+          </div>
+        </div>
+      </div>`;
+
+  return `
     <div class="ai-panel-shell">
       <div class="ai-panel-header">
         <div class="ai-panel-title">AI 助手</div>
@@ -3987,21 +4196,7 @@ function loadSplitRightAssistant(jobId, options = {}) {
       </div>
       <div class="ai-panel-main">
         <div class="ai-messages" id="aiMessages">
-          <div class="message ai">
-            <div class="message-avatar ai-avatar">🤖</div>
-            <div class="message-body">
-              <div class="message-meta">
-                <span class="message-sender">AI 助手</span>
-                <span class="message-time">${getAIChatTime()}</span>
-              </div>
-              <div class="message-bubble">
-                <div class="message-text">
-                  你好！我是你的简历优化助手。<br>
-                  你可以发送消息让我帮你优化简历、分析岗位匹配度，或者直接提问。
-                </div>
-              </div>
-            </div>
-          </div>
+          ${welcomeText}
           <div class="typing-indicator" id="typingIndicator" style="display: none;">
             <span></span><span></span><span></span>
           </div>
@@ -4018,6 +4213,15 @@ function loadSplitRightAssistant(jobId, options = {}) {
       </div>
     </div>
   `;
+}
+
+function loadSplitRightAssistant(jobId, options = {}) {
+  const containerId = options.containerId || 'splitRight';
+  const sessionKey = options.sessionKey || jobId;
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  container.innerHTML = buildAssistantPanelShell({ mode: 'split' });
 
   // 恢复历史消息
   const savedMessages = loadAssistantSession(sessionKey);
@@ -4061,6 +4265,160 @@ function loadSplitRightAssistant(jobId, options = {}) {
 function getAIChatTime() {
   const now = new Date();
   return `${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`;
+}
+
+/* ==================== Workspace AI 助手渲染函数 ==================== */
+
+/** 构建单条消息 HTML */
+function buildMsgHtml(msg) {
+  if (msg.role === 'user') {
+    return `<div class="message user" data-msg-id="${msg.id}">
+      <div class="message-body">
+        <div class="message-meta">
+          <span class="message-sender">你</span>
+          <span class="message-time">${msg.timestamp || ''}</span>
+        </div>
+        <div class="message-bubble">
+          <div class="message-text">${escapeHtml(msg.text)}</div>
+        </div>
+      </div>
+      <div class="message-avatar user-avatar">👤</div>
+    </div>`;
+  }
+  if (msg.role === 'system') {
+    return `<div class="message ai" data-msg-id="${msg.id}">
+      <div class="message-avatar ai-avatar">⚙️</div>
+      <div class="message-body">
+        <div class="message-meta">
+          <span class="message-sender">系统</span>
+          <span class="message-time">${msg.timestamp || ''}</span>
+        </div>
+        <div class="message-bubble">
+          <div class="message-text">${msg.text.replace(/\n/g, '<br>')}</div>
+        </div>
+      </div>
+    </div>`;
+  }
+  // assistant
+  const cursor = msg.status === 'streaming' ? '<span class="streaming-cursor">▊</span>' : '';
+  return `<div class="message ai" data-msg-id="${msg.id}">
+    <div class="message-avatar ai-avatar">🤖</div>
+    <div class="message-body">
+      <div class="message-meta">
+        <span class="message-sender">AI 助手</span>
+        <span class="message-time">${msg.timestamp || ''}</span>
+      </div>
+      <div class="message-bubble">
+        <div class="message-text">${msg.text.replace(/\n/g, '<br>')}${cursor}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+/** workspace 消息区全量渲染（只操作 #aiMessages 内部，不碰面板结构） */
+function renderWorkspaceAssistant() {
+  const aiMessages = document.getElementById('aiMessages');
+  if (!aiMessages) return;
+
+  let html = wsAssistant.messages.map(msg => buildMsgHtml(msg)).join('');
+
+  // 追加进度状态
+  if (wsAssistant.streamStatusLines.length > 0) {
+    html += `<div class="ai-stream-status" style="display:block">`;
+    html += wsAssistant.streamStatusLines.slice(-8).map(l => `<div class="ai-stream-line">${l}</div>`).join('');
+    html += `</div>`;
+  }
+
+  // 推荐进度
+  if (wsAssistant.recommendProgress) {
+    html += `<div class="ai-recommend-progress"><span class="recommend-spinner"></span> 正在智能匹配岗位...</div>`;
+  }
+
+  // typing indicator
+  html += `<div class="typing-indicator" id="typingIndicator" style="display: ${wsAssistant.running ? 'flex' : 'none'}"><span></span><span></span><span></span></div>`;
+
+  aiMessages.innerHTML = html;
+  aiMessages.scrollTop = aiMessages.scrollHeight;
+}
+
+/** 流式期间增量更新（按 streamingMsgId 精确定位） */
+function patchStreamingMessage() {
+  const aiMessages = document.getElementById('aiMessages');
+  if (!aiMessages) return;
+
+  const targetEl = aiMessages.querySelector(`[data-msg-id="${wsAssistant.streamingMsgId}"]`);
+  if (!targetEl) {
+    renderWorkspaceAssistant(); // 降级全量渲染
+    return;
+  }
+
+  const msg = wsAssistant.messages.find(m => m.id === wsAssistant.streamingMsgId);
+  if (msg) {
+    const textEl = targetEl.querySelector('.message-text');
+    if (textEl) textEl.innerHTML = msg.text.replace(/\n/g, '<br>') + '<span class="streaming-cursor">▊</span>';
+  }
+
+  // 更新 status lines
+  const statusEl = aiMessages.querySelector('.ai-stream-status');
+  if (statusEl && wsAssistant.streamStatusLines.length > 0) {
+    statusEl.innerHTML = wsAssistant.streamStatusLines.slice(-8).map(l => `<div class="ai-stream-line">${l}</div>`).join('');
+    statusEl.style.display = 'block';
+  }
+
+  aiMessages.scrollTop = aiMessages.scrollHeight;
+}
+
+/** RAF 防抖渲染调度 */
+let assistantRenderRAF = null;
+
+function scheduleAssistantRender(forceFull = false) {
+  if (assistantRenderRAF) cancelAnimationFrame(assistantRenderRAF);
+  assistantRenderRAF = requestAnimationFrame(() => {
+    if (forceFull || wsAssistant.phase !== 'streaming') {
+      renderWorkspaceAssistant();
+    } else {
+      patchStreamingMessage();
+    }
+    assistantRenderRAF = null;
+  });
+}
+
+/** SSE 事件 → state 更新（不碰 DOM） */
+function applyAssistantEventToState(event) {
+  if (event.type === 'trace' && event.message) {
+    const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    const extra = [];
+    if (event.tool) extra.push(`工具: ${event.tool}`);
+    if (event.file) extra.push(`文件: ${event.file}`);
+    wsAssistant.streamStatusLines.push(`[${ts}] ${event.message}${extra.length ? ` | ${extra.join(' | ')}` : ''}`);
+    if (wsAssistant.streamStatusLines.length > 20) wsAssistant.streamStatusLines = wsAssistant.streamStatusLines.slice(-20);
+  }
+  if (event.type === 'tool' && event.tool === 'smart_job_recommend') {
+    wsAssistant.recommendProgress = true;
+  }
+  // job_recommendations → 保存到 state 供渲染
+  if (event.type === 'job_recommendations' && Array.isArray(event.jobs)) {
+    window.__lastRecommendations = event;
+  }
+}
+
+/** 简历 ops 实时应用（独立于 AI 面板 DOM） */
+function applyResumeOpsRealtime(ops) {
+  try {
+    if (!getCurrentResumeDocument() && currentResumeDraftMd) {
+      initResumeDocumentFromMarkdown(currentResumeDraftMd);
+    }
+    const doc = getCurrentResumeDocument();
+    if (doc) {
+      executeBatch(ops, 'direct');
+      const newMd = doc.toMarkdown();
+      currentResumeDraftMd = newMd;
+      if (currentResume) currentResume.content_md = newMd;
+      refreshAllResumeViews();
+    }
+  } catch (e) {
+    console.warn('[AI] 实时 ops 应用失败:', e.message);
+  }
 }
 
 function addAIUserMessage(text) {
@@ -4378,6 +4736,194 @@ function formatDeepThinkReply(dtData) {
   return html;
 }
 
+/* ==================== 顶层：深度思考判断 + 发送消息 + 完成处理 ==================== */
+
+/** 判断是否触发深度思考（从闭包提取为顶层函数） */
+function shouldTriggerDeepThink(text, context) {
+  const msg = String(text || '').trim();
+  if (!msg) return false;
+  if (msg.length < 10) return false;
+  const greetings = ['你好', '您好', 'hi', 'hello', '在吗', '嗨', '你是谁', '谢谢', '好的', '嗯', 'ok', 'thanks', '再见', 'bye'];
+  if (greetings.includes(msg.toLowerCase())) return false;
+  if (msg.length < 20 && (msg.endsWith('？') || msg.endsWith('?'))) return false;
+  const explicitKeywords = ['深度分析', '深度思考', '深入分析', '多轮推理', '全面分析', '详细拆解', '根本原因', '深入思考'];
+  if (explicitKeywords.some(k => msg.includes(k))) return true;
+  const analysisKeywords = ['分析', '对比', '评估', '匹配', '差距', '优化', '策略', '建议', '改进', '诊断', '问题'];
+  const hasAnalysis = analysisKeywords.some(k => msg.includes(k));
+  if (hasAnalysis && msg.length >= 15) return true;
+  if (context?.jobId && msg.length >= 40) return true;
+  return false;
+}
+
+/** 处理 SSE 完成，更新占位消息为最终结果 */
+function processAssistantDone(data, assistantMsgId) {
+  let reply = data.reply || data.message || data.response || '（无回复）';
+  if (typeof reply === 'string' && reply.trim().startsWith('{')) {
+    try {
+      const leaked = JSON.parse(reply.trim());
+      if (leaked.reply) reply = leaked.reply;
+      else if (leaked.action && leaked.content) reply = leaked.content;
+    } catch {}
+  }
+
+  const resumeContentMd = data.resume_updated_content_md;
+  // 在 delete 之前提取，避免后续判断时字段已丢失
+  const toolTrace = data.tool_trace || [];
+  delete data.memory_update_reason;
+  delete data.tool_trace;
+  delete data.resume_updated_content_md;
+
+  // 把占位消息改为最终回复
+  const msg = wsAssistant.messages.find(m => m.id === assistantMsgId);
+  if (msg) {
+    msg.text = reply;
+    msg.status = 'done';
+  }
+
+  // 脏标记（基于提取的 toolTrace 局部变量）
+  for (const t of toolTrace) {
+    if (['batch_select_jobs', 'batch_deselect_jobs', 'clear_all_favorites', 'filter_favorites'].includes(t.tool)) {
+      wsAssistant.dirtyFavorites = true;
+    }
+    if (t.tool === 'smart_job_recommend' && t.result && t.result.auto_selected) {
+      wsAssistant.dirtyFavorites = true;
+    }
+  }
+
+  // 处理 resume 更新
+  if (data.resume_updated) {
+    if (data.resume_ops && Array.isArray(data.resume_ops) && data.resume_ops.length > 0) {
+      try {
+        if (!getCurrentResumeDocument() && currentResumeDraftMd) {
+          initResumeDocumentFromMarkdown(currentResumeDraftMd);
+        }
+        const doc = getCurrentResumeDocument();
+        if (doc) {
+          executeBatch(data.resume_ops, 'direct');
+          const newMd = doc.toMarkdown();
+          currentResumeDraftMd = newMd;
+          if (currentResume) currentResume.content_md = newMd;
+          updateResumeContent(newMd).catch(e => console.warn('[AI] 保存失败:', e.message));
+          refreshAllResumeViews();
+        }
+      } catch {
+        if (resumeContentMd) {
+          currentResumeDraftMd = resumeContentMd;
+          if (currentResume) currentResume.content_md = resumeContentMd;
+          refreshAllResumeViews();
+        }
+      }
+      const summary = data.resume_change_summary;
+      let summaryText = summary && summary.changed_sections
+        ? `简历已更新：修改了 ${summary.changed_sections.join('、')}`
+        : '简历已根据 AI 建议更新，请查看中栏';
+      wsAssistant.messages.push({ id: Date.now(), role: 'system', text: summaryText, timestamp: getAIChatTime(), status: 'done' });
+    } else if (resumeContentMd) {
+      currentResumeDraftMd = resumeContentMd;
+      if (currentResume) currentResume.content_md = resumeContentMd;
+      refreshAllResumeViews();
+      wsAssistant.messages.push({ id: Date.now(), role: 'system', text: '简历已根据 AI 建议更新', timestamp: getAIChatTime(), status: 'done' });
+    }
+  }
+
+  // 脏视图刷新
+  if (wsAssistant.dirtyFavorites) { loadDeliveryList(); wsAssistant.dirtyFavorites = false; }
+
+  wsAssistant.phase = 'done';
+  wsAssistant.recommendProgress = false;
+  wsAssistant.streamingMsgId = null;
+  saveAssistantSession(wsAssistant.sessionKey, wsAssistant.messages.filter(m => m.status === 'done').map(m => ({ role: m.role, text: m.text })));
+  scheduleAssistantRender(true);
+}
+
+/** workspace 路径：发送 AI 消息（顶层函数，防重入 + activeRequestId 校验 + 只写 state） */
+async function sendAIMessage() {
+  if (wsAssistant.running) return;
+
+  const input = document.getElementById('aiInput');
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+
+  input.value = '';
+
+  const requestId = Date.now();
+  wsAssistant.activeRequestId = requestId;
+  wsAssistant.running = true;
+  wsAssistant.sendBtnDisabled = true;
+  wsAssistant.phase = 'streaming';
+  wsAssistant.streamStatusLines = [];
+  wsAssistant.recommendProgress = false;
+
+  // 追加用户消息到 state
+  wsAssistant.messages.push({ id: requestId, role: 'user', text, timestamp: getAIChatTime(), status: 'done' });
+
+  // 插入占位 assistant 消息（status='streaming'）
+  const assistantMsgId = requestId + 1;
+  wsAssistant.streamingMsgId = assistantMsgId;
+  wsAssistant.messages.push({ id: assistantMsgId, role: 'assistant', text: '', timestamp: getAIChatTime(), status: 'streaming' });
+
+  saveAssistantSession(wsAssistant.sessionKey, wsAssistant.messages.filter(m => m.status === 'done').map(m => ({ role: m.role, text: m.text })));
+  scheduleAssistantRender(true);
+
+  try {
+    const dtToggle = document.getElementById('sp-dt-toggle');
+    const deepThinkEnabled = dtToggle && dtToggle.checked;
+    const shouldDT = deepThinkEnabled && shouldTriggerDeepThink(text, { jobId: null, resumeReady: !!currentResumeDraftMd });
+
+    let data;
+    if (shouldDT) {
+      wsAssistant.phase = 'deep_think';
+      scheduleAssistantRender(true);
+      data = await deepThink(text, null);
+      data = { reply: formatDeepThinkReply(data), resume_updated: false };
+    } else {
+      data = await chatWithAIAssistantStream(null, text,
+        wsAssistant.messages.filter(m => m.status === 'done').map(m => ({ role: m.role, text: m.text })),
+        (event) => {
+          if (wsAssistant.activeRequestId !== requestId) return;
+
+          applyAssistantEventToState(event);
+
+          if (event.type === 'text_delta' && event.text) {
+            const msg = wsAssistant.messages.find(m => m.id === assistantMsgId);
+            if (msg) msg.text += event.text;
+          }
+
+          if (event.type === 'resume_ops_batch' && Array.isArray(event.ops)) {
+            applyResumeOpsRealtime(event.ops);
+          }
+
+          scheduleAssistantRender();
+        }
+      );
+    }
+
+    if (wsAssistant.activeRequestId !== requestId) return;
+    processAssistantDone(data, assistantMsgId);
+  } catch (err) {
+    if (wsAssistant.activeRequestId !== requestId) return;
+    const msg = wsAssistant.messages.find(m => m.id === assistantMsgId);
+    if (msg) {
+      msg.text = '请求失败: ' + err.message;
+      msg.status = 'done';
+      msg.role = 'system';
+    }
+    wsAssistant.phase = 'error';
+    wsAssistant.running = false;
+    wsAssistant.sendBtnDisabled = false;
+    scheduleAssistantRender(true);
+  } finally {
+    if (wsAssistant.activeRequestId === requestId) {
+      wsAssistant.running = false;
+      wsAssistant.sendBtnDisabled = false;
+      const sendBtn = document.getElementById('sendBtn');
+      if (sendBtn) sendBtn.disabled = false;
+      scheduleAssistantRender();
+    }
+  }
+}
+
 /**
  * 绑定 AI 助手面板的所有事件
  * @param {number|null} jobId 目标岗位 ID
@@ -4395,34 +4941,7 @@ function bindSplitRightAssistantEvents(jobId, options = {}) {
   const spProvider = document.getElementById('sp-ai-provider');
 
   // 发送消息
-function shouldTriggerDeepThink(text, context) {
-  const msg = String(text || '').trim();
-  if (!msg) return false;
 
-  // 太短的消息不触发深度思考
-  if (msg.length < 10) return false;
-
-  // 常见问候语不触发
-  const greetings = ['你好', '您好', 'hi', 'hello', '在吗', '嗨', '你是谁', '谢谢', '好的', '嗯', 'ok', 'thanks', '再见', 'bye'];
-  if (greetings.includes(msg.toLowerCase())) return false;
-
-  // 简单疑问句不触发
-  if (msg.length < 20 && (msg.endsWith('？') || msg.endsWith('?'))) return false;
-
-  // 显式深度思考关键词 → 强制触发
-  const explicitKeywords = ['深度分析', '深度思考', '深入分析', '多轮推理', '全面分析', '详细拆解', '根本原因', '深入思考'];
-  if (explicitKeywords.some(k => msg.includes(k))) return true;
-
-  // 分析型关键词 + 足够长度 → 触发
-  const analysisKeywords = ['分析', '对比', '评估', '匹配', '差距', '优化', '策略', '建议', '改进', '诊断', '问题'];
-  const hasAnalysis = analysisKeywords.some(k => msg.includes(k));
-  if (hasAnalysis && msg.length >= 15) return true;
-
-  // 有岗位上下文且消息足够复杂 → 触发
-  if (context?.jobId && msg.length >= 40) return true;
-
-  return false;
-}
 
   async function sendAIMessage() {
     if (!aiInput) return;
@@ -4585,6 +5104,8 @@ function shouldTriggerDeepThink(text, context) {
       }
       // Never expose internal fields to the UI
       const resumeContentMd = data.resume_updated_content_md;
+      // 在 delete 之前提取，避免后续判断时字段已丢失
+      const toolTrace = data.tool_trace || [];
       delete data.memory_update_reason;
       delete data.tool_trace;
       delete data.resume_updated_content_md;
@@ -4592,7 +5113,7 @@ function shouldTriggerDeepThink(text, context) {
       const reply = displayReply;
       addAIResponseMessage(reply);
       // 渲染推荐岗位卡片（如果本轮有推荐结果）
-      if (data.tool_trace && data.tool_trace.some(t => t.tool === 'smart_job_recommend')) {
+      if (toolTrace.some(t => t.tool === 'smart_job_recommend')) {
         try {
           renderJobRecommendationCards(data);
         } catch (renderErr) {
@@ -4600,7 +5121,7 @@ function shouldTriggerDeepThink(text, context) {
         }
       }
       // 收藏列表同步：检查本轮是否有工具实际修改了收藏状态
-      if (data.tool_trace && data.tool_trace.some(t => {
+      if (toolTrace.some(t => {
         if (t.tool === 'batch_select_jobs' || t.tool === 'batch_deselect_jobs' || t.tool === 'clear_all_favorites' || t.tool === 'filter_favorites') return true;
         if (t.tool === 'smart_job_recommend' && t.result && t.result.auto_selected) return true;
         return false;

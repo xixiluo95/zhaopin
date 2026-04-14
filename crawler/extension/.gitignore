@@ -1,0 +1,36 @@
+# Backup files
+*.bak
+*.orig
+*~
+
+# Test output / screenshots
+test-output/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node (if any dev deps)
+node_modules/
+
+# Environment / secrets
+.env
+.env.*
+*.local
+
+# Logs
+*.log
+
+# Chinese internal docs (not for public repo)
+待实测验证项.md
+紧急修复-code37搜索反爬.md
+实测结果记录.md
+实施确认.md
+实施验证清单.md
+修复总结-*.md
+IMPLEMENTATION-PLAN-*.md
+M7_M8_*.md
+WORK-BREAKDOWN-*.md
+QUICK_TEST.md
+TESTING_README.md
+resume-pagination-demo.txt
