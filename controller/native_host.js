@@ -109,6 +109,166 @@ function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function runCommand(command, args, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      resolve({
+        success: false,
+        error: `${command} timed out after ${timeoutMs}ms`,
+        stdout,
+        stderr
+      });
+    }, timeoutMs);
+
+    child.stdout.on('data', chunk => { stdout += chunk.toString(); });
+    child.stderr.on('data', chunk => { stderr += chunk.toString(); });
+    child.on('error', error => {
+      clearTimeout(timer);
+      resolve({
+        success: false,
+        error: error.message,
+        stdout,
+        stderr
+      });
+    });
+    child.on('close', code => {
+      clearTimeout(timer);
+      resolve({
+        success: code === 0,
+        code,
+        error: code === 0 ? '' : (stderr || `${command} exited with code ${code}`),
+        stdout,
+        stderr
+      });
+    });
+  });
+}
+
+async function commandExists(command) {
+  const checker = process.platform === 'win32' ? 'where' : 'sh';
+  const args = process.platform === 'win32' ? [command] : ['-lc', `command -v ${command}`];
+  const result = await runCommand(checker, args, 1500);
+  return result.success;
+}
+
+async function runPythonMouseClick(x, y) {
+  const script = [
+    'from pynput.mouse import Button, Controller',
+    'import time',
+    'mouse = Controller()',
+    `mouse.position = (${x}, ${y})`,
+    'time.sleep(0.08)',
+    'mouse.press(Button.left)',
+    'time.sleep(0.08)',
+    'mouse.release(Button.left)'
+  ].join('; ');
+
+  const python = await commandExists('python3') ? 'python3' : 'python';
+  if (!(await commandExists(python))) {
+    return {
+      success: false,
+      error: 'Neither xdotool nor python/pynput is available for system-level clicking.'
+    };
+  }
+
+  return runCommand(python, ['-c', script], 5000);
+}
+
+function normalizeCoordinate(value, name) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    throw new Error(`Invalid ${name}: ${value}`);
+  }
+  return Math.round(number);
+}
+
+async function clickMouseAt(message) {
+  const x = normalizeCoordinate(message.x, 'x');
+  const y = normalizeCoordinate(message.y, 'y');
+
+  if (process.platform === 'linux') {
+    if (!(await commandExists('xdotool'))) {
+      const sessionType = process.env.XDG_SESSION_TYPE || 'unknown';
+      const pynputClick = await runPythonMouseClick(x, y);
+      if (pynputClick.success) {
+        return {
+          ...pynputClick,
+          platform: process.platform,
+          sessionType,
+          command: 'python3 pynput click',
+          x,
+          y
+        };
+      }
+
+      return {
+        success: false,
+        error: `xdotool is not installed or unavailable, and pynput fallback failed. Current session=${sessionType}. pynput error: ${pynputClick.error || pynputClick.stderr || 'unknown'}`,
+        platform: process.platform,
+        sessionType,
+        fallback: pynputClick
+      };
+    }
+
+    const move = await runCommand('xdotool', ['mousemove', '--sync', String(x), String(y)], 3000);
+    if (!move.success) {
+      return { ...move, platform: process.platform, command: 'xdotool mousemove' };
+    }
+
+    const click = await runCommand('xdotool', ['click', '1'], 3000);
+    return {
+      ...click,
+      platform: process.platform,
+      command: 'xdotool click',
+      x,
+      y
+    };
+  }
+
+  if (process.platform === 'darwin') {
+    const script = `tell application "System Events" to click at {${x}, ${y}}`;
+    const result = await runCommand('osascript', ['-e', script], 3000);
+    return {
+      ...result,
+      platform: process.platform,
+      command: 'osascript click',
+      x,
+      y
+    };
+  }
+
+  if (process.platform === 'win32') {
+    const script = [
+      'Add-Type -AssemblyName System.Windows.Forms;',
+      'Add-Type -TypeDefinition "using System; using System.Runtime.InteropServices; public class Mouse { [DllImport(\\"user32.dll\\")] public static extern bool SetCursorPos(int X, int Y); [DllImport(\\"user32.dll\\")] public static extern void mouse_event(int flags, int dx, int dy, int data, int extra); }";',
+      `[Mouse]::SetCursorPos(${x}, ${y}) | Out-Null;`,
+      '[Mouse]::mouse_event(0x0002, 0, 0, 0, 0);',
+      'Start-Sleep -Milliseconds 80;',
+      '[Mouse]::mouse_event(0x0004, 0, 0, 0, 0);'
+    ].join(' ');
+    const result = await runCommand('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], 5000);
+    return {
+      ...result,
+      platform: process.platform,
+      command: 'powershell mouse_event',
+      x,
+      y
+    };
+  }
+
+  return {
+    success: false,
+    error: `Unsupported platform for system click: ${process.platform}`,
+    platform: process.platform
+  };
+}
+
 function pingController(timeoutMs = 1200) {
   return new Promise((resolve) => {
     const req = http.get(`${CONTROLLER_BASE_URL}/status`, (res) => {
@@ -321,6 +481,8 @@ async function handleMessage(message, state) {
       };
     case 'session_event':
       return handleSessionEvent(message, state);
+    case 'mouse_click':
+      return clickMouseAt(message);
     default:
       return {
         success: false,

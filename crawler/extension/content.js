@@ -51,6 +51,25 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           sendResponse(detail);
           break;
 
+        case 'GET_CHAT_BUTTON_TARGET':
+          const chatTarget = await getBossChatButtonTarget();
+          sendResponse(chatTarget);
+          break;
+
+        case 'OBSERVE_CHAT_CLICK_RESULT':
+          const observedResult = await observeBossChatClickResult({
+            urlBefore: request.urlBefore || window.location.href || '',
+            buttonText: request.buttonText || '立即沟通',
+            timeoutMs: request.timeoutMs || 7000
+          });
+          sendResponse(observedResult);
+          break;
+
+        case 'DOM_CLICK_AND_VERIFY':
+          const domClickResult = await executeDomClickAndVerify();
+          sendResponse(domClickResult);
+          break;
+
         default:
           sendResponse({ success: false, error: 'Unknown type' });
       }
@@ -508,3 +527,604 @@ async function getJobDetail(securityId, lid) {
 }
 
 console.log('[BossScraper] Ready');
+
+// ============ Boss Chat 投递相关函数 ============
+
+function normalizeText(value) {
+  return (value || '').replace(/\s+/g, ' ').trim();
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isVisibleElement(element) {
+  if (!element) return false;
+  const style = window.getComputedStyle(element);
+  if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+
+function getElementText(element) {
+  return normalizeText(element?.innerText || element?.textContent || '');
+}
+
+function isSecurityCheckPage() {
+  const href = window.location.href || '';
+  const bodyText = normalizeText(document.body?.innerText || '');
+  return href.includes('_security_check') ||
+    /环境存在异常|安全验证|请完成验证|验证后继续访问/.test(bodyText);
+}
+
+function isLoginPage() {
+  const bodyText = normalizeText(document.body?.innerText || '');
+  return /登录|login|扫码登录|账号登录/.test(bodyText) &&
+    document.querySelector('input[type="password"], .login-box, .login-form, [class*="login"]');
+}
+
+function hasAlreadyChattedSignal() {
+  return Array.from(document.querySelectorAll('a, button, div, span'))
+    .some(element => isVisibleElement(element) && getElementText(element) === '继续沟通');
+}
+
+function getBossUnavailableReason() {
+  const bodyText = normalizeText(document.body?.innerText || '');
+  if (/职位已关闭|停止招聘|已停止招聘|职位不存在|职位已下线|岗位已下线|招聘已结束|该职位不存在/.test(bodyText)) {
+    return '岗位不可沟通或已关闭';
+  }
+  return '';
+}
+
+function findBossChatTargetButton() {
+  const selectors = [
+    '.btn-greet',
+    '.op-btn-chat',
+    '[class*="greet"]',
+    '[class*="chat"]',
+    'a[class*="greet"]',
+    'button[class*="greet"]',
+    'a[class*="chat"]',
+    'button[class*="chat"]'
+  ];
+
+  for (const selector of selectors) {
+    const candidates = Array.from(document.querySelectorAll(selector));
+    const match = candidates.find(element =>
+      isVisibleElement(element) &&
+      !element.disabled &&
+      getElementText(element) === '立即沟通'
+    );
+    if (match) return match;
+  }
+
+  return Array.from(document.querySelectorAll('a, button, div, span')).find(element =>
+    isVisibleElement(element) &&
+    !element.disabled &&
+    getElementText(element) === '立即沟通'
+  ) || null;
+}
+
+async function waitForBossChatButton(timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const button = findBossChatTargetButton();
+    if (button) return button;
+    await sleep(400);
+  }
+  return null;
+}
+
+function getClickableElement(element) {
+  return element.closest?.('a, button, [role="button"]') || element;
+}
+
+function getViewportScreenOffset() {
+  const borderX = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+  const toolbarY = Math.max(0, window.outerHeight - window.innerHeight - borderX);
+  return {
+    x: window.screenX + borderX,
+    y: window.screenY + toolbarY
+  };
+}
+
+// ============ GET_CHAT_BUTTON_TARGET ============
+
+async function getBossChatButtonTarget() {
+  const urlBefore = window.location.href || '';
+
+  if (isSecurityCheckPage()) {
+    return {
+      success: false,
+      status: 'security_check',
+      buttonText: '',
+      urlBefore,
+      urlAfter: urlBefore,
+      reason: '当前页面是安全验证页'
+    };
+  }
+
+  if (isLoginPage()) {
+    return {
+      success: false,
+      status: 'login_required',
+      buttonText: '',
+      urlBefore,
+      urlAfter: urlBefore,
+      reason: '当前页面需要登录'
+    };
+  }
+
+  if (hasAlreadyChattedSignal()) {
+    return {
+      success: true,
+      status: 'already_chatted',
+      buttonText: '继续沟通',
+      urlBefore,
+      urlAfter: urlBefore,
+      reason: '检测到该岗位已沟通过'
+    };
+  }
+
+  const button = await waitForBossChatButton(10000);
+  if (!button) {
+    const unavailableReason = getBossUnavailableReason();
+    return {
+      success: false,
+      status: unavailableReason ? 'unavailable' : 'not_found',
+      buttonText: '',
+      urlBefore,
+      urlAfter: window.location.href || '',
+      reason: unavailableReason || '未找到文本严格等于"立即沟通"的按钮'
+    };
+  }
+
+  const target = getClickableElement(button);
+  target.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'center' });
+  await sleep(300 + Math.random() * 400);
+
+  const rect = target.getBoundingClientRect();
+  const clientX = rect.left + rect.width * (0.35 + Math.random() * 0.3);
+  const clientY = rect.top + rect.height * (0.35 + Math.random() * 0.3);
+  const screenOffset = getViewportScreenOffset();
+
+  // 视口异常检测
+  if (window.innerHeight < 500) {
+    console.warn('[BossScraper] Abnormal viewport:', window.innerWidth, 'x', window.innerHeight);
+  }
+
+  return {
+    success: true,
+    status: 'target_found',
+    buttonText: getElementText(button),
+    urlBefore,
+    urlAfter: window.location.href || '',
+    reason: '已定位立即沟通按钮',
+    target: {
+      clientX,
+      clientY,
+      screenX: Math.round(screenOffset.x + clientX),
+      screenY: Math.round(screenOffset.y + clientY),
+      rect: {
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height
+      },
+      viewport: {
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        outerWidth: window.outerWidth,
+        outerHeight: window.outerHeight,
+        screenX: window.screenX,
+        screenY: window.screenY,
+        devicePixelRatio: window.devicePixelRatio || 1
+      },
+      element: {
+        tag: target.tagName?.toLowerCase() || '',
+        text: getElementText(target),
+        className: String(target.className || '').slice(0, 120)
+      }
+    }
+  };
+}
+
+// ============ OBSERVE_CHAT_CLICK_RESULT ============
+
+function hasChatDialogSignal() {
+  const dialogSelectors = [
+    '.chat-wrap',
+    '.chat-dialog',
+    '.im-chat-dialog',
+    '.geek-chat-popup'
+  ];
+  for (const selector of dialogSelectors) {
+    const el = document.querySelector(selector);
+    if (el && isVisibleElement(el)) return true;
+  }
+  return false;
+}
+
+function hasSuccessToastSignal() {
+  const toastPattern = /沟通申请已发送|已发送沟通|发送成功|投递成功/;
+  const allText = normalizeText(document.body?.innerText || '');
+  if (toastPattern.test(allText)) return true;
+
+  const toastSelectors = [
+    '.toast-message',
+    '.el-message',
+    '.ant-message',
+    '[class*="toast"]'
+  ];
+  for (const selector of toastSelectors) {
+    const els = Array.from(document.querySelectorAll(selector));
+    if (els.some(el => isVisibleElement(el) && /发送|成功|沟通/.test(normalizeText(el.innerText)))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function observeBossChatClickResult({ urlBefore, buttonText, timeoutMs = 5000 }) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const urlAfter = window.location.href || '';
+
+    if (isSecurityCheckPage()) {
+      return {
+        success: false,
+        status: 'security_check',
+        buttonText,
+        urlBefore,
+        urlAfter,
+        reason: '点击后进入安全验证'
+      };
+    }
+
+    if (isLoginPage()) {
+      return {
+        success: false,
+        status: 'login_required',
+        buttonText,
+        urlBefore,
+        urlAfter,
+        reason: '点击后进入登录页'
+      };
+    }
+
+    if (/\/web\/geek\/chat/.test(urlAfter) ||
+        hasAlreadyChattedSignal() ||
+        hasChatDialogSignal() ||
+        hasSuccessToastSignal()) {
+      return {
+        success: true,
+        status: 'clicked',
+        buttonText,
+        urlBefore,
+        urlAfter,
+        reason: '检测到聊天跳转、继续沟通按钮、聊天弹窗或成功提示'
+      };
+    }
+
+    await sleep(500);
+  }
+
+  // 超时后再次检查
+  const finalUrl = window.location.href || '';
+  if (hasAlreadyChattedSignal() || hasChatDialogSignal() || hasSuccessToastSignal()) {
+    return {
+      success: true,
+      status: 'clicked',
+      buttonText,
+      urlBefore,
+      urlAfter: finalUrl,
+      reason: '超时后检测到成功信号'
+    };
+  }
+
+  return {
+    success: false,
+    status: 'clicked_unknown',
+    buttonText,
+    urlBefore,
+    urlAfter: finalUrl,
+    reason: '已点击，但未观测到明确跳转'
+  };
+}
+
+// ============ DOM 点击投递（替代 Native Host 坐标点击） ============
+
+function findBossChatButton() {
+  const candidates = Array.from(
+    document.querySelectorAll(
+      'button, a, [role="button"], [class*="greet"], [class*="chat"]'
+    )
+  );
+
+  return candidates.find(element => {
+    const text = normalizeText(
+      element.innerText ||
+      element.textContent ||
+      element.getAttribute('aria-label') ||
+      ''
+    );
+
+    return (
+      /^(立即沟通|继续沟通|打招呼)$/.test(text) &&
+      isVisible(element) &&
+      isInsideJobDetail(element)
+    );
+  }) || null;
+}
+
+function isInsideJobDetail(element) {
+  return Boolean(
+    element.closest(
+      '.job-detail, .job-detail-box, .job-primary, main, [class*="job-detail"]'
+    )
+  );
+}
+
+function isVisible(element) {
+  if (!element?.isConnected) return false;
+  const rect = element.getBoundingClientRect();
+  const style = window.getComputedStyle(element);
+  return (
+    rect.width > 0 &&
+    rect.height > 0 &&
+    style.display !== 'none' &&
+    style.visibility !== 'hidden' &&
+    Number(style.opacity) > 0
+  );
+}
+
+function isElementUncovered(element) {
+  const rect = element.getBoundingClientRect();
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+
+  const topElement = document.elementFromPoint(x, y);
+
+  return Boolean(
+    topElement &&
+    (
+      topElement === element ||
+      element.contains(topElement) ||
+      topElement.contains(element)
+    )
+  );
+}
+
+function inspectTopOverlay() {
+  const overlays = document.querySelectorAll(
+    '.dialog-container, .modal, [class*="dialog"], [class*="modal"], [class*="overlay"], [class*="popup"]'
+  );
+  for (const el of overlays) {
+    if (isVisible(el)) {
+      const text = normalizeText(el.innerText || '');
+      if (/登录|验证|安全|频繁|关闭|下架/.test(text)) {
+        return text.slice(0, 100);
+      }
+    }
+  }
+  return '';
+}
+
+function dispatchDomClickSequence(element) {
+  const rect = element.getBoundingClientRect();
+  const clientX = rect.left + rect.width / 2;
+  const clientY = rect.top + rect.height / 2;
+
+  const common = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX,
+    clientY,
+    button: 0,
+    buttons: 1,
+    view: window
+  };
+
+  element.dispatchEvent(new PointerEvent('pointerover', {
+    ...common,
+    pointerId: 1,
+    pointerType: 'mouse',
+    isPrimary: true
+  }));
+
+  element.dispatchEvent(new MouseEvent('mouseover', common));
+
+  element.dispatchEvent(new PointerEvent('pointerdown', {
+    ...common,
+    pointerId: 1,
+    pointerType: 'mouse',
+    isPrimary: true
+  }));
+
+  element.dispatchEvent(new MouseEvent('mousedown', common));
+
+  element.dispatchEvent(new PointerEvent('pointerup', {
+    ...common,
+    pointerId: 1,
+    pointerType: 'mouse',
+    isPrimary: true,
+    buttons: 0
+  }));
+
+  element.dispatchEvent(new MouseEvent('mouseup', {
+    ...common,
+    buttons: 0
+  }));
+
+  element.dispatchEvent(new MouseEvent('click', {
+    ...common,
+    buttons: 0
+  }));
+}
+
+function hasRateLimitSignal() {
+  const bodyText = normalizeText(document.body?.innerText || '');
+  return /操作过于频繁|请稍后再试|访问太频繁/.test(bodyText);
+}
+
+function inspectBossChatState(context) {
+  if (isSecurityCheckPage()) {
+    return { success: false, status: 'security_check', reason: '当前页面是安全验证页' };
+  }
+
+  if (isLoginPage()) {
+    return { success: false, status: 'login_required', reason: '当前页面需要登录' };
+  }
+
+  if (hasRateLimitSignal()) {
+    return { success: false, status: 'rate_limited', reason: '操作过于频繁' };
+  }
+
+  if (hasAlreadyChattedSignal()) {
+    return { success: true, status: 'already_chatted', reason: '检测到该岗位已沟通过' };
+  }
+
+  if (hasChatDialogSignal() || hasSuccessToastSignal()) {
+    return { success: true, status: 'clicked', reason: '检测到聊天弹窗或成功提示' };
+  }
+
+  return { success: false, status: 'verification_pending' };
+}
+
+function waitForChatResult(context, timeoutMs = 10000) {
+  return new Promise(resolve => {
+    const startedAt = Date.now();
+
+    const check = () => {
+      const result = inspectBossChatState(context);
+
+      if (
+        result.status !== 'verification_pending' ||
+        Date.now() - startedAt >= timeoutMs
+      ) {
+        observer.disconnect();
+        resolve(
+          result.status === 'verification_pending'
+            ? {
+                success: false,
+                status: 'clicked_unknown',
+                reason: '点击后未发现明确页面状态变化'
+              }
+            : result
+        );
+        return true;
+      }
+      return false;
+    };
+
+    const observer = new MutationObserver(check);
+
+    observer.observe(document.documentElement, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      characterData: true
+    });
+
+    if (check()) return;
+
+    const timer = setInterval(() => {
+      if (check()) {
+        clearInterval(timer);
+      }
+    }, 500);
+  });
+}
+
+async function executeDomClickAndVerify() {
+  const urlBefore = window.location.href || '';
+
+  const initialState = inspectBossChatState({ urlBefore });
+
+  if (initialState.status !== 'verification_pending') {
+    return { ...initialState, urlBefore, urlAfter: urlBefore, method: 'dom' };
+  }
+
+  let button = findBossChatButton();
+
+  if (!button) {
+    return {
+      success: false,
+      status: 'not_found',
+      reason: '未找到"立即沟通"按钮',
+      urlBefore,
+      urlAfter: window.location.href || '',
+      method: 'dom'
+    };
+  }
+
+  button = getClickableElement(button);
+  button.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+  await sleep(300 + Math.random() * 200);
+
+  // 滚动后可能重新渲染，重新获取
+  button = findBossChatButton();
+
+  if (!button || !button.isConnected) {
+    return {
+      success: false,
+      status: 'not_found',
+      reason: '滚动后按钮节点失效',
+      urlBefore,
+      urlAfter: window.location.href || '',
+      method: 'dom'
+    };
+  }
+
+  button = getClickableElement(button);
+
+  if (!isVisible(button)) {
+    return {
+      success: false,
+      status: 'not_found',
+      reason: '按钮不可见',
+      urlBefore,
+      urlAfter: window.location.href || '',
+      method: 'dom'
+    };
+  }
+
+  if (!isElementUncovered(button)) {
+    return {
+      success: false,
+      status: 'not_found',
+      reason: '按钮被遮挡: ' + inspectTopOverlay(),
+      urlBefore,
+      urlAfter: window.location.href || '',
+      method: 'dom'
+    };
+  }
+
+  const buttonTextBefore = normalizeText(button.innerText || button.textContent || '');
+
+  // 第一级：原生 DOM click
+  HTMLElement.prototype.click.call(button);
+
+  let result = await waitForChatResult({ urlBefore, buttonTextBefore }, 6000);
+
+  // 第二级：完整 DOM 事件序列（fallback）
+  if (
+    result.status === 'clicked_unknown' &&
+    button.isConnected &&
+    isVisible(button)
+  ) {
+    await sleep(300);
+    dispatchDomClickSequence(button);
+    result = await waitForChatResult({ urlBefore, buttonTextBefore }, 7000);
+  }
+
+  return {
+    ...result,
+    method: 'dom',
+    urlBefore,
+    urlAfter: window.location.href || '',
+    buttonTextBefore
+  };
+}

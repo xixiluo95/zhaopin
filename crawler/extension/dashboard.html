@@ -36,6 +36,22 @@
           <label>城市</label>
           <input class="crawl-input" id="crawl-city" placeholder="北京、上海、深圳...">
         </div>
+        <div class="crawl-field">
+          <label>经验要求</label>
+          <div class="crawl-multi-select" id="crawl-experience-select">
+            <button class="crawl-multi-select__display" type="button" aria-haspopup="listbox" aria-expanded="false">
+              <span class="crawl-multi-select__placeholder">不限</span>
+            </button>
+            <div class="crawl-multi-select__dropdown" role="listbox">
+              <label><input type="checkbox" value=""> 不限</label>
+              <label><input type="checkbox" value="101"> 应届生</label>
+              <label><input type="checkbox" value="102"> 1-3年</label>
+              <label><input type="checkbox" value="103"> 3-5年</label>
+              <label><input type="checkbox" value="104"> 5-10年</label>
+              <label><input type="checkbox" value="105"> 10年以上</label>
+            </div>
+          </div>
+        </div>
         <div class="crawl-panel__actions">
           <button class="res-btn res-btn--ai" id="crawl-start-btn">开始采集</button>
           <button class="res-btn" id="crawl-stop-btn" disabled>停止采集</button>

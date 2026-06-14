@@ -6,6 +6,7 @@
  */
 
 const { getDatabase } = require('./db');
+const { normalizeExperienceFields } = require('./services/job-filter-protocol');
 
 /**
  * 插入单条职位记录，利用 UNIQUE(platform, platformJobId) 自然去重
@@ -18,6 +19,7 @@ function insertJob(jobData) {
   const rawPayload = jobData.rawPayload
     ? (typeof jobData.rawPayload === 'string' ? jobData.rawPayload : JSON.stringify(jobData.rawPayload))
     : null;
+  const expFields = normalizeExperienceFields(jobData.experience);
 
   const result = db.prepare(`
     INSERT INTO scraped_jobs (
@@ -25,8 +27,9 @@ function insertJob(jobData) {
       keywords, salary, experience, education,
       match_status, selected, crawl_batch_id, crawl_mode,
       job_alive_status, raw_payload,
-      detail_status, detail_error_code
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      detail_status, detail_error_code,
+      experience_raw, experience_min, experience_max, experience_label
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     jobData.platform,
     jobData.platformJobId,
@@ -45,7 +48,11 @@ function insertJob(jobData) {
     jobData.jobAliveStatus || 'unknown',
     rawPayload,
     jobData.detailStatus || deriveDefaultDetailStatus(jobData.platform),
-    jobData.detailErrorCode || null
+    jobData.detailErrorCode || null,
+    expFields.experience_raw,
+    expFields.experience_min,
+    expFields.experience_max,
+    expFields.experience_label
   );
 
   return { id: result.lastInsertRowid, changes: result.changes };
@@ -62,6 +69,7 @@ function insertOrUpdateJob(jobData) {
   const rawPayload = jobData.rawPayload
     ? (typeof jobData.rawPayload === 'string' ? jobData.rawPayload : JSON.stringify(jobData.rawPayload))
     : null;
+  const expFields = normalizeExperienceFields(jobData.experience);
 
   const result = db.prepare(`
     INSERT INTO scraped_jobs (
@@ -69,8 +77,9 @@ function insertOrUpdateJob(jobData) {
       keywords, salary, experience, education,
       match_status, selected, crawl_batch_id, crawl_mode,
       job_alive_status, raw_payload,
-      detail_status, detail_error_code
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      detail_status, detail_error_code,
+      experience_raw, experience_min, experience_max, experience_label
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(platform, platformJobId) DO UPDATE SET
       title = excluded.title,
       company = excluded.company,
@@ -81,7 +90,11 @@ function insertOrUpdateJob(jobData) {
       experience = excluded.experience,
       education = excluded.education,
       raw_payload = excluded.raw_payload,
-      crawled_at = CURRENT_TIMESTAMP
+      crawled_at = CURRENT_TIMESTAMP,
+      experience_raw = excluded.experience_raw,
+      experience_min = excluded.experience_min,
+      experience_max = excluded.experience_max,
+      experience_label = excluded.experience_label
   `).run(
     jobData.platform,
     jobData.platformJobId,
@@ -100,7 +113,11 @@ function insertOrUpdateJob(jobData) {
     jobData.jobAliveStatus || 'unknown',
     rawPayload,
     jobData.detailStatus || deriveDefaultDetailStatus(jobData.platform),
-    jobData.detailErrorCode || null
+    jobData.detailErrorCode || null,
+    expFields.experience_raw,
+    expFields.experience_min,
+    expFields.experience_max,
+    expFields.experience_label
   );
 
   return { id: result.lastInsertRowid, changes: result.changes };
@@ -124,14 +141,16 @@ function batchInsertJobs(jobs) {
         keywords, salary, experience, education,
         match_status, selected, crawl_batch_id, crawl_mode,
         job_alive_status, raw_payload,
-        detail_status, detail_error_code
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        detail_status, detail_error_code,
+        experience_raw, experience_min, experience_max, experience_label
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     for (const job of jobList) {
       const rawPayload = job.rawPayload
         ? (typeof job.rawPayload === 'string' ? job.rawPayload : JSON.stringify(job.rawPayload))
         : null;
+      const expFields = normalizeExperienceFields(job.experience);
 
       const result = stmt.run(
         job.platform,
@@ -151,7 +170,11 @@ function batchInsertJobs(jobs) {
         job.jobAliveStatus || 'unknown',
         rawPayload,
         job.detailStatus || deriveDefaultDetailStatus(job.platform),
-        job.detailErrorCode || null
+        job.detailErrorCode || null,
+        expFields.experience_raw,
+        expFields.experience_min,
+        expFields.experience_max,
+        expFields.experience_label
       );
 
       if (result.changes > 0) {

@@ -18,6 +18,7 @@ const { parseResumeToMarkdown } = require('./services/resume-parser');
 const resumeDb = require('./resume-db');
 const jobsDb = require('./jobs-db');
 const { runDeepThink, resolveDeepThinkMode, validateDeepThinkConfig } = require('./services/ai/deep-think');
+const filterExecutor = require('./services/job-filter-executor');
 
 const AI_BOOTSTRAP_DIR = process.env.ZHAOPIN_AI_BOOTSTRAP_DIR
   || path.join(__dirname, '../crawler/extension/ai-bootstrap');
@@ -393,11 +394,11 @@ const ASSISTANT_TOOL_SCHEMAS = [
   },
   {
     name: 'list_selected_jobs',
-    description: '列出当前工作台卡片区中的岗位摘要，与收藏列表语义一致。',
+    description: '列出当前工作台卡片区中的岗位摘要，与收藏列表语义一致。注意：此工具有数量上限，不适合"清空所有"场景——清空所有请直接用 clear_all_favorites。',
     parameters: {
       type: 'object',
       properties: {
-        limit: { type: 'number', description: '返回条数，默认 10，最大 20' }
+        limit: { type: 'number', description: '返回条数，默认 10，最大 100' }
       },
       required: [],
       additionalProperties: false
@@ -411,7 +412,7 @@ const ASSISTANT_TOOL_SCHEMAS = [
       type: 'object',
       properties: {
         keyword: { type: 'string', description: '搜索关键词' },
-        limit: { type: 'number', description: '返回条数，默认 10，最大 20' }
+        limit: { type: 'number', description: '返回条数，默认 10，最大 100' }
       },
       required: ['keyword'],
       additionalProperties: false
@@ -614,6 +615,83 @@ const ASSISTANT_TOOL_SCHEMAS = [
     },
     returns: '返回匹配的岗位列表、移除/保留数量和原因摘要。'
   },
+  {
+    name: 'preview_job_filter',
+    description: '按条件预览筛选收藏岗位的结果，不会修改数据库。返回匹配和不匹配的岗位列表及原因。建议先 preview 再 apply。',
+    parameters: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['favorites'], description: '筛选范围，默认 favorites' },
+        criteria: {
+          type: 'object',
+          description: '筛选条件',
+          properties: {
+            experience: {
+              type: 'object',
+              description: '经验筛选',
+              properties: {
+                include_ranges: { type: 'array', items: { type: 'string' }, description: '保留的经验范围，如 ["1-3年","3-5年"]' },
+                exclude_ranges: { type: 'array', items: { type: 'string' }, description: '排除的经验范围，如 ["5-10年"]' }
+              },
+              additionalProperties: false
+            },
+            include_keywords: { type: 'array', items: { type: 'string' }, description: '至少匹配一个的关键词（OR）' },
+            exclude_keywords: { type: 'array', items: { type: 'string' }, description: '匹配任一则排除的关键词' },
+            exclude_outsourcing: { type: 'boolean', description: '是否排除外包岗位' }
+          },
+          additionalProperties: false
+        }
+      },
+      required: ['criteria'],
+      additionalProperties: false
+    },
+    returns: '返回预览结果，包括匹配数、排除数和各岗位的排除原因。'
+  },
+  {
+    name: 'apply_job_filter',
+    description: '按条件执行筛选，修改收藏状态。建议先调用 preview_job_filter 确认结果后再调用此工具。',
+    parameters: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['favorites'], description: '筛选范围，默认 favorites' },
+        action: { type: 'string', enum: ['keep_only', 'exclude'], description: 'keep_only=只保留匹配的，exclude=移除匹配的' },
+        criteria: {
+          type: 'object',
+          description: '筛选条件（与 preview_job_filter 相同）',
+          properties: {
+            experience: {
+              type: 'object',
+              properties: {
+                include_ranges: { type: 'array', items: { type: 'string' } },
+                exclude_ranges: { type: 'array', items: { type: 'string' } }
+              },
+              additionalProperties: false
+            },
+            include_keywords: { type: 'array', items: { type: 'string' } },
+            exclude_keywords: { type: 'array', items: { type: 'string' } },
+            exclude_outsourcing: { type: 'boolean' }
+          },
+          additionalProperties: false
+        },
+        preview_id: { type: 'string', description: '之前的预览 ID（可选）' },
+        confirmation_token: { type: 'string', description: '确认 token（低比例保留时需要）' }
+      },
+      required: ['action', 'criteria'],
+      additionalProperties: false
+    },
+    returns: '返回操作结果，包括操作 ID 和影响数量。支持 5 分钟内撤销。'
+  },
+  {
+    name: 'undo_last_filter',
+    description: '撤销最近一次 apply_job_filter 操作（5 分钟内有效），恢复被移除的收藏状态。',
+    parameters: {
+      type: 'object',
+      properties: {},
+      required: [],
+      additionalProperties: false
+    },
+    returns: '返回撤销结果，包括恢复的收藏数量。'
+  },
 ];
 
 function getAssistantToolSchemaMap() {
@@ -759,6 +837,9 @@ function getToolExecutionMeta(toolName) {
     batch_deselect_jobs: 'controller/jobs-db.js',
     clear_all_favorites: 'controller/jobs-db.js',
     filter_favorites: 'controller/ai-handler.js',
+    preview_job_filter: 'controller/services/job-filter-executor.js',
+    apply_job_filter: 'controller/services/job-filter-executor.js',
+    undo_last_filter: 'controller/services/job-filter-executor.js',
   };
 
   return {
@@ -900,7 +981,12 @@ function buildAssistantSystemPrompt({ bootstrapContext, currentJobId }) {
 1. 如果用户明确提到“搜索/采集/批量搜索/后台继续跑”，先调用 enqueue_crawl_tasks 建立后台任务
 2. 需要汇报后台状态时，再调用 get_crawl_queue_status
 3. 如果用户是在已有本地职位库里做推荐/筛选，再调用 smart_job_recommend
-4. 当用户明确要求“放到工作台/加入工作台”时，直接调用 batch_select_jobs，不要只改 selected 不改收藏`,
+4. 当用户明确要求”放到工作台/加入工作台”时，直接调用 batch_select_jobs，不要只改 selected 不改收藏`,
+    `## 清空/移除操作引导规则（最高优先级）
+当用户要求清空、移除所有、全部删除、全部清理工作台卡片/收藏时：
+- 必须直接调用 clear_all_favorites，一次清空全部
+- 禁止走”先 list_selected_jobs → 再 batch_deselect_jobs”的路径，因为 list_selected_jobs 有数量上限，无法一次看到全部岗位
+- 只有当用户要求移除”部分”或”特定”岗位时，才使用 batch_deselect_jobs`,
     `## 硬性约束
 1. 【最小修改原则】只修改用户明确要求的部分，不主动修改其他内容
 2. 【格式保持】保持原有Markdown格式和结构不变
@@ -1202,6 +1288,22 @@ function detectDirectAssistantIntent(message) {
     };
   }
 
+  // 清空全部收藏/工作台卡片的意图检测
+  const clearAllIntent = hasAnyKeyword(text, [
+    /清空.*(所有|全部|所有).*(收藏|岗位|卡片|工作台)/,
+    /清空(收藏|岗位|卡片|工作台)/,
+    /(所有|全部).*(删除|移除|清理|清空).*(收藏|岗位|卡片|工作台)/,
+    /(删除|移除|清理).*(所有|全部).*(收藏|岗位|卡片|工作台)/,
+    /(全部|所有).*(清掉|删掉|移除|清理|清空)/,
+    /把.*(卡片|岗位|收藏).*(全[部都]|清空|删[掉除]|移除|清理|清掉)/,
+    /(卡片|岗位|收藏).*(全[部都]?|清空|删[掉除]|移除|清理|清掉)$/,
+    /工作台.*(卡片|岗位|收藏).*(清空|全删|全部删除|全部移除|全部清理)/,
+  ]);
+
+  if (clearAllIntent) {
+    return { type: 'clear_all_favorites' };
+  }
+
   return null;
 }
 
@@ -1450,6 +1552,53 @@ async function handleDirectAssistantIntent({ db, intent, message, onProgress }) 
     };
   }
 
+  if (intent.type === 'clear_all_favorites') {
+    onProgress?.({
+      type: 'trace',
+      message: '命中清空全部收藏硬路由，直接执行 clear_all_favorites。',
+      category: 'route',
+      file: 'controller/ai-handler.js',
+    });
+    onProgress?.({
+      type: 'phase',
+      message: '正在清空全部收藏岗位...',
+    });
+    const toolResult = await executeAssistantTool({
+      db,
+      toolName: 'clear_all_favorites',
+      args: {},
+      currentJobId: null,
+      resume: null,
+    });
+    const cleared = toolResult.cleared || 0;
+    onProgress?.({
+      type: 'trace',
+      message: `已清空全部收藏，共移除 ${cleared} 条岗位。`,
+      category: 'result',
+      tool: 'clear_all_favorites',
+      file: 'controller/jobs-db.js',
+    });
+
+    return {
+      success: true,
+      reply: `已清空全部收藏，共移除 ${cleared} 条岗位。`,
+      suggestions: [
+        '可以继续让我推荐新的岗位',
+        '可以让我重新采集岗位'
+      ],
+      resume_updated: false,
+      resume_updated_content_md: '',
+      memory_update: { should_update: false, reason: '', content_md: '' },
+      tool_trace: [
+        { tool: 'clear_all_favorites', reason: '命中清空全部收藏硬路由，直接执行数据库批量更新' }
+      ],
+      direct_intent: {
+        type: 'clear_all_favorites',
+        cleared,
+      }
+    };
+  }
+
   return null;
 }
 
@@ -1462,9 +1611,38 @@ function safeParsePayload(rawPayload) {
   }
 }
 
+// TOOL_HANDLERS 委托表：新工具注册在这里，不扩大 switch
+const TOOL_HANDLERS = {
+  preview_job_filter: (ctx) => {
+    return filterExecutor.previewJobFilter({
+      scope: ctx.validatedArgs?.scope || 'favorites',
+      criteria: ctx.validatedArgs?.criteria,
+    });
+  },
+  apply_job_filter: (ctx) => {
+    return filterExecutor.applyJobFilter({
+      scope: ctx.validatedArgs?.scope || 'favorites',
+      action: ctx.validatedArgs?.action,
+      criteria: ctx.validatedArgs?.criteria,
+      preview_id: ctx.validatedArgs?.preview_id || null,
+      confirmation_token: ctx.validatedArgs?.confirmation_token || null,
+    });
+  },
+  undo_last_filter: () => {
+    return filterExecutor.undoLastFilter();
+  },
+};
+
 async function executeAssistantTool({ db, toolName, args, currentJobId, resume, onProgress = null }) {
   const validatedArgs = validateAssistantToolArguments(toolName, args);
 
+  // 新工具优先走 TOOL_HANDLERS
+  const handler = TOOL_HANDLERS[toolName];
+  if (handler) {
+    return handler({ db, validatedArgs, currentJobId, resume, onProgress });
+  }
+
+  // 旧工具走 legacy switch
   switch (toolName) {
     case 'get_tool_guide': {
       const guide = getAssistantToolGuide(validatedArgs?.tool_name);
@@ -1495,7 +1673,7 @@ async function executeAssistantTool({ db, toolName, args, currentJobId, resume, 
       };
     }
     case 'list_selected_jobs': {
-      const limit = Math.max(1, Math.min(Number(validatedArgs?.limit) || 10, 20));
+      const limit = Math.max(1, Math.min(Number(validatedArgs?.limit) || 10, 100));
       const rows = db.prepare(
         'SELECT id, title, company, location, salary, keywords FROM scraped_jobs WHERE is_favorite = 1 ORDER BY id DESC LIMIT ?'
       ).all(limit);
@@ -1503,7 +1681,7 @@ async function executeAssistantTool({ db, toolName, args, currentJobId, resume, 
     }
     case 'search_jobs_db': {
       const keyword = String(validatedArgs?.keyword || '').trim();
-      const limit = Math.max(1, Math.min(Number(validatedArgs?.limit) || 10, 20));
+      const limit = Math.max(1, Math.min(Number(validatedArgs?.limit) || 10, 100));
       const rows = db.prepare(`
         SELECT id, title, company, location, salary, keywords
         FROM scraped_jobs
@@ -2071,6 +2249,9 @@ async function runAssistantLoopWithProgress({ llmClient, systemPrompt, conversat
           batch_deselect_jobs: '📤 正在移出工作台...',
         clear_all_favorites: '🗑️ 正在清空全部收藏...',
           filter_favorites: '🔍 正在语义筛选收藏...',
+          preview_job_filter: '🔍 正在预览筛选结果...',
+          apply_job_filter: '✅ 正在执行筛选操作...',
+          undo_last_filter: '↩️ 正在撤销筛选操作...',
         };
         onProgress({ type: 'tool', tool: toolName, message: TOOL_LABELS[toolName] || `🔧 正在执行 ${toolName}...` });
 
@@ -2179,6 +2360,9 @@ async function runAssistantLoopWithProgress({ llmClient, systemPrompt, conversat
         batch_deselect_jobs: '📤 正在移出工作台...',
         clear_all_favorites: '🗑️ 正在清空全部收藏...',
         filter_favorites: '🔍 正在语义筛选收藏...',
+        preview_job_filter: '🔍 正在预览筛选结果...',
+        apply_job_filter: '✅ 正在执行筛选操作...',
+        undo_last_filter: '↩️ 正在撤销筛选操作...',
       };
       onProgress({
         type: 'trace',

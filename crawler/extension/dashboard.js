@@ -5,7 +5,7 @@
 
 import {
   fetchJobs, fetchJobDetail, selectJob, favoriteJob, setFavoriteJob, batchFavoriteJobs,
-  fetchDeliveryList, uploadResume, fetchResume,
+  fetchDeliveryList, fetchBossApplyBatch, uploadResume, fetchResume,
   updateResumeContent, getAIConfig, saveAIConfig,
   optimizeResume, matchJobs, exportPDFViaAPI, clearAllJobs,
   deepThink, saveDeepThinkConfig, saveSecondaryModel,
@@ -1194,6 +1194,16 @@ let currentResumeDraftMd = '';     // 稳定简历草稿源，模板切换不修
 let aiConversationHistory = [];    // AI 助手对话历史（split view 使用）
 let workspaceAssistantVisible = false;
 
+/* 收藏变更工具集合 - 统一管理需要触发收藏刷新的工具名 */
+const FAVORITE_MUTATION_TOOLS = new Set([
+  'batch_select_jobs',
+  'batch_deselect_jobs',
+  'clear_all_favorites',
+  'filter_favorites',
+  'apply_job_filter',
+  'undo_last_filter',
+]);
+
 /* ==================== Workspace AI 助手状态（唯一真相） ==================== */
 const wsAssistant = {
   mounted: false,
@@ -1688,7 +1698,13 @@ function loadResumeView() {
     container.innerHTML = `
       <div class="ws">
         <div class="ws-del">
-          <h3 class="ws-del__title">收藏列表 <span id="delivery-count" class="ws-del__count"></span></h3>
+          <div class="ws-del__head">
+            <h3 class="ws-del__title">收藏列表 <span id="delivery-count" class="ws-del__count"></span></h3>
+            <div class="ws-del__actions">
+              <button class="res-btn ws-del__apply-matched" id="btn-delivery-apply-matched" type="button" disabled>投递匹配</button>
+              <button class="res-btn res-btn--g ws-del__apply-all" id="btn-delivery-apply-all" type="button" disabled>全部投递</button>
+            </div>
+          </div>
           <div id="delivery-content"></div>
         </div>
         <div class="ws-res" id="wsResPanel">
@@ -1706,6 +1722,8 @@ function loadResumeView() {
     `;
 
     bindWorkspaceAssistantToggle();
+    bindDeliveryApplyAllButton();
+    bindDeliveryApplyMatchedButton();
     resumeViewInitialized = true;
   }
 
@@ -3611,10 +3629,13 @@ function formatFileSize(bytes) {
 /* ==================== N3 WP2: 收藏列表 ==================== */
 
 let currentSplitJobId = null;
+let dashboardBossApplyRequestHandled = false;
 
 async function loadDeliveryList() {
   const container = document.getElementById('delivery-content');
   const countEl = document.getElementById('delivery-count');
+  const applyAllBtn = document.getElementById('btn-delivery-apply-all');
+  const applyMatchedBtn = document.getElementById('btn-delivery-apply-matched');
   if (!container) return;
 
   container.innerHTML = '<div class="loading">加载中...</div>';
@@ -3622,12 +3643,15 @@ async function loadDeliveryList() {
   try {
     const data = await fetchDeliveryList();
     const jobs = data.jobs || [];
+    const bossJobs = jobs.filter(isBossDeliveryJob);
     workspaceFavoriteCount = jobs.length;
 
     if (countEl) {
       countEl.textContent = jobs.length > 0 ? `${jobs.length}` : '';
       countEl.style.display = jobs.length > 0 ? 'inline-block' : 'none';
     }
+    updateDeliveryApplyAllButton(applyAllBtn, bossJobs.length);
+    updateDeliveryApplyMatchedButton(applyMatchedBtn, jobs);
 
     if (jobs.length === 0) {
       container.innerHTML = '<div class="empty-state">暂无收藏岗位</div>';
@@ -3642,9 +3666,271 @@ async function loadDeliveryList() {
     container.innerHTML = '<div class="empty-state"></div>';
     workspaceFavoriteCount = 0;
     if (countEl) { countEl.textContent = ''; countEl.style.display = 'none'; }
+    updateDeliveryApplyAllButton(applyAllBtn, 0);
+    updateDeliveryApplyMatchedButton(applyMatchedBtn, []);
     applyWorkspaceLayoutState();
     showToast('加载收藏列表失败: ' + err.message, 'error');
   }
+}
+
+function isBossDeliveryJob(job) {
+  const platform = String(job?.platform || '').toLowerCase();
+  const url = getDeliveryJobUrl(job);
+  return Boolean(url) && (platform === 'boss' || /zhipin\.com/i.test(url));
+}
+
+function getDeliveryJobUrl(job) {
+  return String(job?.url || job?.source_url || job?.link || '').trim();
+}
+
+function parseJobRawPayload(job) {
+  if (!job || !job.raw_payload) return null;
+  if (typeof job.raw_payload === 'object') return job.raw_payload;
+  if (typeof job.raw_payload !== 'string') return null;
+  try {
+    return JSON.parse(job.raw_payload);
+  } catch {
+    return null;
+  }
+}
+
+function getJobMatchScore(job) {
+  const raw = parseJobRawPayload(job);
+  const candidates = [
+    job?.match_score,
+    job?.ai_match_score,
+    job?.profile_match_score,
+    job?.resume_match_score,
+    job?.matchScore,
+    job?.score,
+    job?.['画像匹配分'],
+    raw?.match_score,
+    raw?.ai_match_score,
+    raw?.profile_match_score,
+    raw?.resume_match_score,
+    raw?.matchScore,
+    raw?.score,
+    raw?.['画像匹配分'],
+  ];
+
+  for (const value of candidates) {
+    const score = Number(String(value ?? '').replace('%', '').trim());
+    if (Number.isFinite(score)) return score;
+  }
+
+  return null;
+}
+
+function getMatchedBossDeliveryJobs(jobs) {
+  const bossJobs = (jobs || []).filter(isBossDeliveryJob);
+  const scoredBossJobs = bossJobs.filter(job => getJobMatchScore(job) != null);
+  if (scoredBossJobs.length === 0) return bossJobs;
+  return scoredBossJobs.filter(job => getJobMatchScore(job) > 50);
+}
+
+function buildBossChatJobPayload(job) {
+  return {
+    id: job.id != null ? String(job.id) : '',
+    url: getDeliveryJobUrl(job),
+    title: job.title || '',
+    company: job.company || '',
+    platform: job.platform || 'boss',
+  };
+}
+
+async function sendBossChatBatch(jobs, { mode, confirmationSource }) {
+  return sendChromeMessage({
+    type: 'CHAT_WITH_BOSS_BATCH',
+    mode,
+    confirmationSource,
+    confirmationToken: `${mode}_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+    jobs: jobs.map(buildBossChatJobPayload),
+  });
+}
+
+async function fetchPendingBossApplyBatch() {
+  try {
+    return await fetchBossApplyBatch();
+  } catch (error) {
+    const extensionUrl = chrome.runtime.getURL('boss-apply-batch-pending.json');
+    const response = await fetch(extensionUrl, { cache: 'no-store' });
+    if (!response.ok) {
+      throw error;
+    }
+    return response.json();
+  }
+}
+
+function updateDeliveryApplyAllButton(button, bossJobCount) {
+  if (!button) return;
+  button.disabled = bossJobCount === 0;
+  button.title = bossJobCount > 0
+    ? `投递 ${bossJobCount} 个 Boss 收藏岗位`
+    : '暂无可投递的 Boss 收藏岗位';
+}
+
+function updateDeliveryApplyMatchedButton(button, jobs) {
+  if (!button) return;
+  const matchedBossJobs = getMatchedBossDeliveryJobs(jobs || []);
+  button.disabled = matchedBossJobs.length === 0;
+  button.title = matchedBossJobs.length > 0
+    ? `投递 ${matchedBossJobs.length} 个匹配 Boss 岗位`
+    : '暂无可投递的匹配 Boss 岗位';
+}
+
+function bindDeliveryApplyMatchedButton() {
+  const btn = document.getElementById('btn-delivery-apply-matched');
+  if (!btn || btn.dataset.bound === 'true') return;
+  btn.dataset.bound = 'true';
+  btn.addEventListener('click', handleDeliveryApplyMatchedClick);
+}
+
+function bindDeliveryApplyAllButton() {
+  const btn = document.getElementById('btn-delivery-apply-all');
+  if (!btn || btn.dataset.bound === 'true') return;
+  btn.dataset.bound = 'true';
+  btn.addEventListener('click', handleDeliveryApplyAllClick);
+}
+
+async function handleDeliveryApplyAllClick() {
+  const btn = document.getElementById('btn-delivery-apply-all');
+  if (!btn || btn.disabled) return;
+
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = '投递中...';
+
+  try {
+    const data = await fetchDeliveryList();
+    const bossJobs = (data.jobs || []).filter(isBossDeliveryJob);
+
+    if (bossJobs.length === 0) {
+      showToast('暂无可投递的 Boss 收藏岗位', 'error');
+      return;
+    }
+
+    const result = await sendBossChatBatch(bossJobs, {
+      mode: 'apply_all_favorites',
+      confirmationSource: 'dashboard_all_button',
+    });
+
+    if (result?.success) {
+      showToast(result.message || `已开始投递 ${bossJobs.length} 个 Boss 收藏岗位`, 'success');
+      loadDeliveryList();
+      return;
+    }
+
+    showToast(result?.reason || result?.error || '后台批量投递能力尚未接入', 'error');
+  } catch (err) {
+    showToast('全部投递失败: ' + err.message, 'error');
+  } finally {
+    btn.textContent = originalText;
+    const data = await fetchDeliveryList().catch(() => ({ jobs: [] }));
+    updateDeliveryApplyAllButton(btn, (data.jobs || []).filter(isBossDeliveryJob).length);
+  }
+}
+
+async function handleDeliveryApplyMatchedClick() {
+  const btn = document.getElementById('btn-delivery-apply-matched');
+  if (!btn || btn.disabled) return;
+
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = '投递中...';
+
+  try {
+    const data = await fetchDeliveryList();
+    const jobs = data.jobs || [];
+    const matchedBossJobs = getMatchedBossDeliveryJobs(jobs);
+
+    if (matchedBossJobs.length === 0) {
+      showToast('暂无可投递的匹配 Boss 岗位', 'error');
+      return;
+    }
+
+    const result = await sendBossChatBatch(matchedBossJobs, {
+      mode: 'apply_matched_favorites',
+      confirmationSource: 'dashboard_matched_button',
+    });
+
+    if (result?.success) {
+      showToast(result.message || `已加入 ${matchedBossJobs.length} 个匹配 Boss 岗位`, 'success');
+      loadDeliveryList();
+      return;
+    }
+
+    showToast(result?.reason || result?.error || '后台投递能力尚未接入', 'error');
+  } catch (err) {
+    showToast('投递匹配失败: ' + err.message, 'error');
+  } finally {
+    btn.textContent = originalText;
+    const data = await fetchDeliveryList().catch(() => ({ jobs: [] }));
+    updateDeliveryApplyMatchedButton(btn, data.jobs || []);
+  }
+}
+
+async function handleDeliveryApplyOneClick(button) {
+  const jobId = parseInt(button.dataset.id, 10);
+  if (!jobId) return;
+
+  button.disabled = true;
+  const originalText = button.textContent;
+  button.textContent = '投递中...';
+
+  try {
+    const data = await fetchDeliveryList();
+    const job = (data.jobs || []).find(item => Number(item.id) === jobId);
+
+    if (!job) {
+      showToast('未找到该收藏岗位', 'error');
+      return;
+    }
+
+    if (!isBossDeliveryJob(job)) {
+      showToast('仅 Boss 岗位支持插件投递', 'error');
+      return;
+    }
+
+    const result = await sendBossChatBatch([job], {
+      mode: 'apply_single_favorite',
+      confirmationSource: 'dashboard_single_button',
+    });
+
+    if (result?.success) {
+      button.textContent = '已触发';
+      showToast(result.message || '已开始投递该 Boss 岗位', 'success');
+      return;
+    }
+
+    showToast(result?.reason || result?.error || '后台投递能力尚未接入', 'error');
+    button.textContent = originalText;
+  } catch (err) {
+    showToast('投递失败: ' + err.message, 'error');
+    button.textContent = originalText;
+  } finally {
+    setTimeout(() => {
+      button.disabled = false;
+      button.textContent = originalText;
+    }, 2500);
+  }
+}
+
+function sendChromeMessage(message) {
+  return new Promise((resolve, reject) => {
+    if (!window.chrome?.runtime?.sendMessage) {
+      reject(new Error('Chrome 扩展运行环境不可用'));
+      return;
+    }
+
+    chrome.runtime.sendMessage(message, response => {
+      const runtimeError = chrome.runtime.lastError;
+      if (runtimeError) {
+        reject(new Error(runtimeError.message));
+        return;
+      }
+      resolve(response);
+    });
+  });
 }
 
 function renderDeliveryItem(job) {
@@ -3655,6 +3941,7 @@ function renderDeliveryItem(job) {
   const location = escapeHtml(job.location || '未知');
   const experience = escapeHtml(job.experience || '');
   const education = escapeHtml(job.education || '');
+  const canApplyBoss = isBossDeliveryJob(job);
 
   const platformNames = {
     'boss': 'Boss',
@@ -3676,6 +3963,7 @@ function renderDeliveryItem(job) {
         ${education ? `<p>学历：${education}</p>` : ''}
       </div>
       <div class="delivery-detail__actions">
+        ${canApplyBoss ? `<button class="btn-boss-apply" data-id="${job.id}">投递该岗位</button>` : ''}
         <button class="btn-cancel-select" data-id="${job.id}">取消收藏</button>
         <button class="btn-ai-match" data-id="${job.id}"
                 ${!aiConfigured ? 'disabled title="请先配置 AI"' : 'title="AI 智能匹配"'}>AI 智能匹配</button>
@@ -3686,9 +3974,16 @@ function renderDeliveryItem(job) {
 
 function bindDeliveryEvents(container) {
   container.addEventListener('click', async (e) => {
+    // 单条 Boss 投递按钮
+    const bossApplyBtn = e.target.closest('.btn-boss-apply');
+    if (bossApplyBtn) {
+      await handleDeliveryApplyOneClick(bossApplyBtn);
+      return;
+    }
+
     // 点击 .ws-item-main 区域 → 打开 50/50 分屏
     const mainArea = e.target.closest('.ws-item-main');
-    if (mainArea && !e.target.closest('.btn-cancel-select') && !e.target.closest('.btn-ai-match')) {
+    if (mainArea && !e.target.closest('.btn-cancel-select') && !e.target.closest('.btn-ai-match') && !e.target.closest('.btn-boss-apply')) {
       const wsItem = mainArea.closest('.ws-item');
       if (wsItem && wsItem.dataset.id) {
         const jobId = parseInt(wsItem.dataset.id, 10);
@@ -3764,6 +4059,105 @@ function bindDeliveryEvents(container) {
       }
     }
   });
+}
+
+function getDashboardBossApplyRequest() {
+  const params = new URLSearchParams(window.location.search || '');
+  const jobId = Number(params.get('bossApplyJobId') || 0);
+  const directUrl = String(params.get('bossApplyUrl') || '').trim();
+  const batch = params.get('bossApplyBatch');
+  if (Number.isInteger(jobId) && jobId > 0) {
+    return { type: 'favorite_id', jobId };
+  }
+  if (batch === 'pending') {
+    return { type: 'pending_batch' };
+  }
+  if (/https:\/\/(?:www\.)?zhipin\.com\//i.test(directUrl)) {
+    return {
+      type: 'direct_url',
+      job: {
+        id: params.get('bossApplyJobKey') || '',
+        url: directUrl,
+        title: params.get('bossApplyTitle') || 'Boss 岗位',
+        company: params.get('bossApplyCompany') || '',
+        platform: 'boss',
+      }
+    };
+  }
+  return null;
+}
+
+async function triggerBossApplyFromDashboardUrl() {
+  if (dashboardBossApplyRequestHandled) return;
+  const request = getDashboardBossApplyRequest();
+  if (!request) return;
+
+  dashboardBossApplyRequestHandled = true;
+  if ((location.hash || '#home') !== '#resume') {
+    location.hash = '#resume';
+  }
+
+  try {
+    if (request.type === 'pending_batch') {
+      const data = await fetchPendingBossApplyBatch();
+      const jobs = (data.jobs || []).filter(isBossDeliveryJob);
+      if (jobs.length === 0) {
+        showToast('待投递批量任务里没有可投递 Boss 岗位', 'error');
+        return;
+      }
+
+      const result = await sendBossChatBatch(jobs, {
+        mode: 'apply_pending_batch_from_dashboard',
+        confirmationSource: 'dashboard_pending_batch_url_param',
+      });
+
+      if (result?.success) {
+        showToast(result.message || `已通过 dashboard 触发 ${jobs.length} 个 Boss 岗位投递`, 'success');
+      } else {
+        showToast(result?.reason || result?.error || 'dashboard 触发批量投递失败', 'error');
+      }
+      return;
+    }
+
+    let job = request.job || null;
+    if (request.type === 'favorite_id') {
+      const data = await fetchDeliveryList();
+      job = (data.jobs || []).find(item => Number(item.id) === request.jobId);
+      if (!job) {
+        showToast('URL 参数指定的收藏岗位不存在', 'error');
+        return;
+      }
+    }
+
+    if (!isBossDeliveryJob(job)) {
+      showToast('URL 参数指定的岗位不是可投递 Boss 岗位', 'error');
+      return;
+    }
+
+    const result = await sendBossChatBatch([job], {
+      mode: request.type === 'favorite_id' ? 'apply_single_favorite_url' : 'apply_single_direct_url',
+      confirmationSource: 'dashboard_url_param',
+    });
+
+    if (result?.success) {
+      showToast(result.message || '已通过 dashboard 触发 Boss 单条投递', 'success');
+    } else {
+      showToast(result?.reason || result?.error || 'dashboard 触发投递失败', 'error');
+    }
+  } catch (err) {
+    showToast('dashboard 触发投递失败: ' + err.message, 'error');
+  } finally {
+    history.replaceState(null, '', `${location.pathname}${location.hash || ''}`);
+  }
+}
+
+function reloadExtensionFromDashboardUrl() {
+  const params = new URLSearchParams(window.location.search || '');
+  if (params.get('reloadExtension') !== '1') return false;
+
+  showToast('正在重载扩展后台', 'info');
+  setTimeout(() => chrome.runtime.reload(), 300);
+  return true;
 }
 
 /* ==================== M10-N3-WP2/WP3/WP4: 50/50 分屏 ==================== */
@@ -4481,6 +4875,57 @@ function renderJobRecommendationCards(data) {
 }
 
 /**
+ * 渲染筛选预览卡片
+ * 展示 preview 结果、命中/排除数量、排除原因
+ */
+function renderFilterPreviewCard(previewResult) {
+  const aiMessages = document.getElementById('aiMessages');
+  if (!aiMessages) return;
+
+  const { preview_id, matched_count, excluded_count, total, excluded = [], requires_confirmation } = previewResult;
+
+  const card = document.createElement('div');
+  card.className = 'ai-filter-preview-card';
+  card.dataset.previewId = preview_id;
+
+  const excludedHtml = excluded.slice(0, 10).map(e =>
+    `<div class="filter-excluded-item">
+      <span class="filter-excluded-title">${escapeHtml(e.title || '')}</span>
+      <span class="filter-excluded-company">${escapeHtml(e.company || '')}</span>
+      <span class="filter-excluded-reason">${escapeHtml(e.reason || '')}</span>
+    </div>`
+  ).join('');
+
+  card.innerHTML = `
+    <div class="filter-preview-header">
+      <span class="filter-preview-icon">🔍</span>
+      <span class="filter-preview-title">筛选预览</span>
+    </div>
+    <div class="filter-preview-summary">
+      <span class="filter-stat">共 ${total} 个收藏</span>
+      <span class="filter-stat matched">匹配 ${matched_count} 个</span>
+      <span class="filter-stat excluded">排除 ${excluded_count} 个</span>
+    </div>
+    ${excluded_count > 0 ? `
+      <div class="filter-excluded-list">
+        <div class="filter-excluded-header">排除详情（前 10 条）：</div>
+        ${excludedHtml}
+        ${excluded_count > 10 ? `<div class="filter-more">...还有 ${excluded_count - 10} 条</div>` : ''}
+      </div>
+    ` : ''}
+    ${requires_confirmation ? '<div class="filter-warning">⚠️ 匹配比例较低（<10%），需要用户确认后才能执行</div>' : ''}
+  `;
+
+  const lastMessage = aiMessages.querySelector('.message.ai:last-of-type');
+  if (lastMessage) {
+    lastMessage.after(card);
+  } else {
+    aiMessages.appendChild(card);
+  }
+  aiMessages.scrollTop = aiMessages.scrollHeight;
+}
+
+/**
  * 渲染单个推荐岗位卡片
  */
 function renderSingleRecommendCard(job) {
@@ -4782,7 +5227,7 @@ function processAssistantDone(data, assistantMsgId) {
 
   // 脏标记（基于提取的 toolTrace 局部变量）
   for (const t of toolTrace) {
-    if (['batch_select_jobs', 'batch_deselect_jobs', 'clear_all_favorites', 'filter_favorites'].includes(t.tool)) {
+    if (FAVORITE_MUTATION_TOOLS.has(t.tool)) {
       wsAssistant.dirtyFavorites = true;
     }
     if (t.tool === 'smart_job_recommend' && t.result && t.result.auto_selected) {
@@ -5120,9 +5565,18 @@ function bindSplitRightAssistantEvents(jobId, options = {}) {
           console.warn('[AI] 推荐卡片渲染失败:', renderErr.message);
         }
       }
+      // 渲染筛选预览卡片
+      const previewTrace = toolTrace.find(t => t.tool === 'preview_job_filter' && t.result && t.result.success);
+      if (previewTrace) {
+        try {
+          renderFilterPreviewCard(previewTrace.result);
+        } catch (renderErr) {
+          console.warn('[AI] 筛选预览卡片渲染失败:', renderErr.message);
+        }
+      }
       // 收藏列表同步：检查本轮是否有工具实际修改了收藏状态
       if (toolTrace.some(t => {
-        if (t.tool === 'batch_select_jobs' || t.tool === 'batch_deselect_jobs' || t.tool === 'clear_all_favorites' || t.tool === 'filter_favorites') return true;
+        if (FAVORITE_MUTATION_TOOLS.has(t.tool)) return true;
         if (t.tool === 'smart_job_recommend' && t.result && t.result.auto_selected) return true;
         return false;
       })) {
@@ -5580,6 +6034,14 @@ let isCrawling = false;
 let crawlPanelInited = false;
 let crawlPollTimer = null;  // 状态轮询定时器
 let verificationPromptVisible = false;
+const CRAWL_EXPERIENCE_MAX_SELECTIONS = 3;
+const CRAWL_EXPERIENCE_LABELS = {
+  '101': '应届生',
+  '102': '1-3年',
+  '103': '3-5年',
+  '104': '5-10年',
+  '105': '10年以上',
+};
 
 function showVerificationPrompt(verification) {
   const overlay = document.getElementById('verifyOverlay');
@@ -5700,11 +6162,139 @@ function calculateCrawlProgress(stats) {
 function formatCrawlStatusMessage(stats) {
   if (!stats) return '采集中...';
   const parts = [];
+  if (stats.experienceLabel) parts.push(`经验 ${stats.experienceLabel}`);
+  if (stats.experienceRunIndex && stats.experienceRunTotal) {
+    parts.push(`${stats.experienceRunIndex}/${stats.experienceRunTotal}`);
+  }
   if (stats.totalJobs > 0) parts.push(`岗位 ${stats.totalJobs}`);
   if (stats.detailSuccessCount > 0) parts.push(`详情 ${stats.detailSuccessCount}`);
   if (stats.successWithDesc > 0) parts.push(`含描述 ${stats.successWithDesc}`);
   if (stats.failCount > 0) parts.push(`失败 ${stats.failCount}`);
   return parts.length > 0 ? `采集中: ${parts.join(' | ')}` : '采集中...';
+}
+
+function getCrawlExperienceSelect() {
+  return document.getElementById('crawl-experience-select');
+}
+
+function getSelectedExperience() {
+  const root = getCrawlExperienceSelect();
+  if (!root || root.classList.contains('is-disabled')) return [];
+  return Array.from(root.querySelectorAll('input[type="checkbox"]:checked'))
+    .map(input => input.value)
+    .filter(Boolean);
+}
+
+function updateCrawlExperienceDisplay() {
+  const root = getCrawlExperienceSelect();
+  if (!root) return;
+
+  const display = root.querySelector('.crawl-multi-select__display');
+  const placeholder = root.querySelector('.crawl-multi-select__placeholder');
+  const selected = getSelectedExperience();
+  const isDisabled = root.classList.contains('is-disabled');
+
+  if (display) {
+    display.disabled = isDisabled;
+    display.setAttribute('aria-expanded', root.classList.contains('is-open') ? 'true' : 'false');
+  }
+
+  if (!placeholder) return;
+  if (isDisabled) {
+    placeholder.textContent = '仅 Boss 支持';
+    return;
+  }
+
+  if (selected.length === 0) {
+    placeholder.textContent = '不限';
+    return;
+  }
+
+  const visible = selected.slice(0, 2);
+  placeholder.innerHTML = visible
+    .map(value => `<span class="crawl-multi-select__tag">${escapeHtml(CRAWL_EXPERIENCE_LABELS[value] || value)}</span>`)
+    .join('') + (selected.length > 2 ? `<span class="crawl-multi-select__more">+${selected.length - 2}</span>` : '');
+}
+
+function closeCrawlExperienceDropdown() {
+  const root = getCrawlExperienceSelect();
+  if (!root) return;
+  root.classList.remove('is-open');
+  updateCrawlExperienceDisplay();
+}
+
+function setCrawlExperienceEnabled(enabled) {
+  const root = getCrawlExperienceSelect();
+  if (!root) return;
+  root.classList.toggle('is-disabled', !enabled);
+  if (!enabled) {
+    root.classList.remove('is-open');
+  }
+  updateCrawlExperienceDisplay();
+}
+
+function bindCrawlExperienceSelect() {
+  const root = getCrawlExperienceSelect();
+  if (!root || root.dataset.bound === 'true') return;
+  root.dataset.bound = 'true';
+
+  const display = root.querySelector('.crawl-multi-select__display');
+  const checkboxes = Array.from(root.querySelectorAll('input[type="checkbox"]'));
+
+  display?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    if (root.classList.contains('is-disabled')) return;
+    root.classList.toggle('is-open');
+    updateCrawlExperienceDisplay();
+  });
+
+  root.addEventListener('click', event => {
+    event.stopPropagation();
+  });
+
+  checkboxes.forEach(input => {
+    input.addEventListener('change', () => {
+      const unlimited = checkboxes.find(item => item.value === '');
+      const selectedSpecific = checkboxes.filter(item => item.value && item.checked);
+
+      if (input.value === '' && input.checked) {
+        checkboxes.forEach(item => {
+          if (item.value) item.checked = false;
+        });
+      } else if (input.value && input.checked) {
+        if (unlimited) unlimited.checked = false;
+        if (selectedSpecific.length > CRAWL_EXPERIENCE_MAX_SELECTIONS) {
+          input.checked = false;
+          showToast(`经验要求最多选择 ${CRAWL_EXPERIENCE_MAX_SELECTIONS} 项`, 'error');
+        }
+      }
+
+      const hasSpecific = checkboxes.some(item => item.value && item.checked);
+      if (unlimited) unlimited.checked = !hasSpecific;
+      updateCrawlExperienceDisplay();
+    });
+  });
+
+  document.addEventListener('click', closeCrawlExperienceDropdown);
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') closeCrawlExperienceDropdown();
+  });
+
+  const unlimited = checkboxes.find(item => item.value === '');
+  if (unlimited) unlimited.checked = true;
+  updateCrawlExperienceDisplay();
+}
+
+function bindCrawlPlatformExperienceState() {
+  const platformSelect = document.getElementById('crawl-platform');
+  if (!platformSelect || platformSelect.dataset.experienceBound === 'true') return;
+  platformSelect.dataset.experienceBound = 'true';
+
+  const sync = () => {
+    setCrawlExperienceEnabled(platformSelect.value === 'boss');
+  };
+  platformSelect.addEventListener('change', sync);
+  sync();
 }
 
 /** 采集完成处理：刷新首页 Grid 并自动导航 */
@@ -5798,12 +6388,15 @@ function initCrawlPanel() {
 
   const startBtn = document.getElementById('crawl-start-btn');
   const stopBtn = document.getElementById('crawl-stop-btn');
+  bindCrawlExperienceSelect();
+  bindCrawlPlatformExperienceState();
 
   if (startBtn) {
     startBtn.addEventListener('click', async () => {
       const platform = document.getElementById('crawl-platform').value;
       const keyword = document.getElementById('crawl-keyword').value.trim();
       const city = document.getElementById('crawl-city').value.trim();
+      const experience = platform === 'boss' ? getSelectedExperience() : [];
 
       // 校验必填项
       if (!keyword) {
@@ -5821,7 +6414,7 @@ function initCrawlPanel() {
         if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
           const response = await chrome.runtime.sendMessage({
             type: 'START_CRAWL',
-            payload: { platform, keyword, city }
+            payload: { platform, keyword, city, experience }
           });
 
           if (response && response.success) {
@@ -5944,6 +6537,8 @@ export function initDashboard() {
     .finally(() => {
       initRouter();
       bindCardClickEvents();
+      if (reloadExtensionFromDashboardUrl()) return;
+      triggerBossApplyFromDashboardUrl();
     });
 }
 

@@ -222,6 +222,13 @@ export async function fetchDeliveryList() {
 }
 
 /**
+ * 获取待通过 Boss 插件沟通的批量任务
+ */
+export async function fetchBossApplyBatch() {
+  return request('/api/boss-chat-batch/pending');
+}
+
+/**
  * 上传简历文件
  * @param {File} file 简历文件
  */

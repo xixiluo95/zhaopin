@@ -6,7 +6,7 @@ const { normalizeCompanyName } = require('./company-normalizer');
 const DATA_DIR = path.join(__dirname, 'data');
 const DEFAULT_DB_PATH = path.join(DATA_DIR, 'zhaopin.db');
 const QUEUE_FILE = path.join(__dirname, 'task_queue.json');
-const SCHEMA_VERSION = 14;
+const SCHEMA_VERSION = 15;
 
 let dbInstance = null;
 
@@ -135,6 +135,11 @@ function initDatabase(dbPath = DEFAULT_DB_PATH) {
   if (currentVersion < 14) {
     migrateToV14(dbInstance);
     currentVersion = 14;
+  }
+
+  if (currentVersion < 15) {
+    migrateToV15(dbInstance);
+    currentVersion = 15;
   }
 
   // 断点恢复：重启后将 running 状态的页码任务重置为 pending
@@ -1167,6 +1172,60 @@ function migrateToV14(db) {
   console.log('[DB] Schema v14: created resume_versions table');
   db.prepare('INSERT INTO schema_version (version, description) VALUES (?, ?)')
     .run(14, 'Add resume_versions table for resume pipeline artifacts');
+}
+
+function migrateToV15(db) {
+  // 为 scraped_jobs 添加经验结构化字段
+  const expColumns = ['experience_raw', 'experience_min', 'experience_max', 'experience_label'];
+  for (const col of expColumns) {
+    if (!hasColumn(db, 'scraped_jobs', col)) {
+      const colType = col === 'experience_raw' || col === 'experience_label'
+        ? 'TEXT' : 'INTEGER';
+      db.exec(`ALTER TABLE scraped_jobs ADD COLUMN ${col} ${colType}`);
+    }
+  }
+
+  // 创建操作日志表（用于 apply undo）
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS job_filter_operations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      operation_id TEXT NOT NULL UNIQUE,
+      action TEXT NOT NULL,
+      scope TEXT NOT NULL,
+      criteria_json TEXT NOT NULL,
+      before_ids_json TEXT NOT NULL,
+      affected_ids_json TEXT NOT NULL,
+      after_ids_json TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      expires_at TEXT NOT NULL,
+      undone_at TEXT
+    );
+  `);
+
+  // 回填已有记录的经验结构化字段
+  const { parseExperienceYears, deriveExperienceLabel } = require('./services/job-filter-protocol');
+  const rows = db.prepare("SELECT id, experience FROM scraped_jobs WHERE experience_raw IS NULL AND experience IS NOT NULL AND experience != ''").all();
+  const updateStmt = db.prepare(
+    'UPDATE scraped_jobs SET experience_raw = ?, experience_min = ?, experience_max = ?, experience_label = ? WHERE id = ?'
+  );
+  const backfill = db.transaction(() => {
+    for (const row of rows) {
+      const parsed = parseExperienceYears(row.experience);
+      const label = deriveExperienceLabel(parsed, row.experience);
+      updateStmt.run(
+        row.experience,
+        parsed ? parsed.min : null,
+        parsed ? parsed.max : null,
+        label,
+        row.id
+      );
+    }
+  });
+  if (rows.length > 0) backfill();
+
+  console.log(`[DB] Schema v15: added experience_raw/min/max/label, created job_filter_operations, backfilled ${rows.length} rows`);
+  db.prepare('INSERT INTO schema_version (version, description) VALUES (?, ?)')
+    .run(15, 'Add experience structured fields and job_filter_operations table');
 }
 
 function hasColumn(db, tableName, columnName) {
