@@ -35,6 +35,7 @@ crawler/popup.html
 crawler/popup.js
 crawler/extension/*.backup.*
 crawler/extension/*.md
+crawler/extension/trigger-batch.html
 crawler/extension/ai_browser_bot.py
 crawler/extension/log_analyzer.py
 crawler/extension/test-runner.html

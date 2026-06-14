@@ -2,6 +2,13 @@
  * Service Worker - 后台调度中心
  */
 
+// 加载 Boss Chat 投递模块（MV3 Service Worker 中使用 importScripts）
+try {
+  importScripts('boss-chat.js');
+} catch (e) {
+  console.warn('[JobHunter] Failed to load boss-chat.js:', e.message);
+}
+
 // ============ 配置 ============
 const FEISHU_CONFIG = {
   appId: 'your_app_id',
@@ -117,6 +124,10 @@ const CONFIG = {
       '机器学习', '深度学习', '多模态', '知识图谱'
     ],
     GENERAL_PM_INCLUDE: /产品经理|product manager|\bpm\b/i,
+    // 外包公司黑名单（公司名称包含任一关键词则过滤）
+    OUTSOURCING_COMPANIES: [
+      '万宝盛华', 'Manpower', '熊猫云聘'
+    ],
     // 最低通过分数（低于此分数的岗位被过滤）
     // 设为-2让条件较好的在校/应届岗有机会通过（如AI产品经理：+2+2-5=-1）
     MIN_SCORE: -2
@@ -151,6 +162,15 @@ const RUNTIME_CONFIG_DEFAULTS = {
   MAX_LIST_PAGES: 1,              // 单次任务最多翻 N 页（默认 1，即只抓 p1）
   DETAIL_BUDGET_PER_RUN: 0,       // 0 = unlimited（不限详情预算）
   DETAIL_REQUEST_INTERVAL_MS: 3000 // 详情请求间隔（毫秒）
+};
+
+const BOSS_EXPERIENCE_LABELS = {
+  '': '不限',
+  '101': '应届生',
+  '102': '1-3年',
+  '103': '3-5年',
+  '104': '5-10年',
+  '105': '10年以上',
 };
 
 const MANUAL_ALARM_PAUSE_MS = 10 * 60 * 1000;
@@ -194,6 +214,22 @@ class JobHunterService {
     this.init();
     // 从storage加载（串行执行，避免竞态）
     this.initPromise = this.runInitializers();
+
+    // 初始化 Boss Chat 投递引擎
+    if (typeof BossChatEngine !== 'undefined') {
+      this.bossChatEngine = new BossChatEngine({
+        sendTabMessage: (tabId, message) => this.sendTabMessageWithRetry(tabId, message),
+        createTab: (props) => this.createTabWithRetry(props),
+        closeTab: (tabId) => chrome.tabs.remove(tabId).catch(() => null),
+        sendNativeMessage: (payload) => this.sendNativeHostMessage(payload),
+        storage: chrome.storage.local,
+        alarms: chrome.alarms,
+        reportToController: (data) => this.reportBossChatResult(data).catch(() => null)
+      });
+      console.log('[JobHunter] BossChatEngine initialized');
+    } else {
+      console.warn('[JobHunter] BossChatEngine not available, boss chat feature disabled');
+    }
   }
 
   // 串行执行所有初始化，确保加载完成后再接受任务
@@ -221,7 +257,10 @@ class JobHunterService {
       detailSuccessCount: 0,
       detailDescriptionNonEmptyCount: 0,
       pagedListCount: 0,
-      pagesFetched: 0
+      pagesFetched: 0,
+      experienceLabel: '',
+      experienceRunIndex: 0,
+      experienceRunTotal: 0
     };
   }
 
@@ -479,6 +518,36 @@ class JobHunterService {
       : RUNTIME_CONFIG_DEFAULTS.EXPERIENCE;
   }
 
+  normalizeExperienceCodes(raw) {
+    const values = Array.isArray(raw)
+      ? raw
+      : (typeof raw === 'string' ? raw.split(',') : []);
+    const seen = new Set();
+    const normalized = [];
+    for (const value of values) {
+      const code = String(value || '').trim();
+      if (!Object.prototype.hasOwnProperty.call(BOSS_EXPERIENCE_LABELS, code)) continue;
+      if (seen.has(code)) continue;
+      seen.add(code);
+      normalized.push(code);
+      if (normalized.length >= 3) break;
+    }
+    return normalized;
+  }
+
+  resolveTaskExperienceCodes(task, isManualTask) {
+    if (isManualTask && Array.isArray(task?.experience)) {
+      return task.experience.length > 0 ? task.experience : [''];
+    }
+    const configured = String(this.getExperienceCode() || '').trim();
+    return [configured];
+  }
+
+  getExperienceLabel(code) {
+    const normalized = String(code || '').trim();
+    return BOSS_EXPERIENCE_LABELS[normalized] || normalized || '不限';
+  }
+
   isControllerDeliveryEnabled() {
     return Boolean(this.runtimeConfig.deliveryEnabled);
   }
@@ -552,6 +621,14 @@ class JobHunterService {
 
   // Alarm 触发处理
   async onAlarm(alarm) {
+    // Boss Chat 队列定时器
+    if (alarm.name === 'boss_chat_queue' || alarm.name === 'boss_chat_backup') {
+      if (this.bossChatEngine) {
+        await this.bossChatEngine.onAlarm();
+      }
+      return;
+    }
+
     if (!alarm.name.startsWith('crawl_')) return;
 
     console.log(`[JobHunter] Alarm triggered: ${alarm.name}`);
@@ -795,6 +872,7 @@ class JobHunterService {
                     code: city?.code || CONFIG.CITIES[0].code
                   },
                   keyword: request.payload.keyword.trim(),
+                  experience: this.normalizeExperienceCodes(request.payload?.experience),
                   taskId: `manual-${Date.now()}`,
                   source: 'manual'
                 };
@@ -936,6 +1014,52 @@ class JobHunterService {
           sendResponse({ success: true });
           break;
 
+        case 'CHAT_WITH_BOSS_BATCH': {
+          if (!this.bossChatEngine) {
+            sendResponse({ success: false, error: 'BossChatEngine not available' });
+            break;
+          }
+          try {
+            const result = await this.bossChatEngine.submitBatch(request.jobs || [], {
+              mode: request.mode || 'batch',
+              confirmationSource: request.confirmationSource || 'dashboard'
+            });
+            sendResponse(result);
+          } catch (error) {
+            console.error('[JobHunter] CHAT_WITH_BOSS_BATCH error:', error);
+            sendResponse({ success: false, error: error.message });
+          }
+          break;
+        }
+
+        case 'GET_BOSS_CHAT_STATUS': {
+          if (!this.bossChatEngine) {
+            sendResponse({ success: false, error: 'BossChatEngine not available' });
+            break;
+          }
+          try {
+            const result = await this.bossChatEngine.getQueueStatus();
+            sendResponse(result);
+          } catch (error) {
+            sendResponse({ success: false, error: error.message });
+          }
+          break;
+        }
+
+        case 'CLEAR_BOSS_CHAT_QUEUE': {
+          if (!this.bossChatEngine) {
+            sendResponse({ success: false, error: 'BossChatEngine not available' });
+            break;
+          }
+          try {
+            const result = await this.bossChatEngine.clear();
+            sendResponse(result);
+          } catch (error) {
+            sendResponse({ success: false, error: error.message });
+          }
+          break;
+        }
+
         case 'CRAWL_RESULT': {
           const { platform, data } = request;
           if (scrapers[platform]) {
@@ -953,6 +1077,30 @@ class JobHunterService {
     } catch (error) {
       console.error('[JobHunter] Error:', error);
       sendResponse({ success: false, error: error.message });
+    }
+  }
+
+  // ============ Boss 投递结果上报 ============
+  async reportBossChatResult(data) {
+    try {
+      // 可选：上报到 Controller，用于 Dashboard 展示投递进度
+      const response = await fetch(`${CONFIG.CONTROLLER_BASE_URL}/report`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'boss_chat_result',
+          ...data,
+          timestamp: Date.now()
+        })
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.warn(`[JobHunter] Boss chat report rejected: ${response.status} ${errorText}`);
+      } else {
+        console.log(`[JobHunter] Boss chat result reported: jobId=${data.jobId}, status=${data.status}`);
+      }
+    } catch (error) {
+      console.warn('[JobHunter] Failed to report boss chat result:', error.message);
     }
   }
 
@@ -1070,6 +1218,7 @@ class JobHunterService {
     }
 
     const { city, keyword, taskId } = task;  // R3: 解构出 taskId
+    const experienceCodes = this.resolveTaskExperienceCodes(task, isManualTask);
     console.log(`[JobHunter] ========================================`);
     console.log(
       `[JobHunter] Starting task: ${keyword} in ${city.name || city} (queue remaining: ${remaining}, taskId: ${taskId || 'N/A'}, CODE_VERSION=${CODE_VERSION}, PIPELINE_VERSION=${PIPELINE_VERSION})`
@@ -1090,7 +1239,7 @@ class JobHunterService {
       console.log('[JobHunter] Creating tab...');
       tab = await chrome.tabs.create({
         url: isManualTask
-          ? this.buildBossSearchUrl(keyword, city.code)
+          ? this.buildBossSearchUrl(keyword, city.code, experienceCodes[0])
           : 'https://www.zhipin.com/web/geek/job',
         active: isManualTask
       });
@@ -1106,46 +1255,60 @@ class JobHunterService {
       // 6. 执行缓冲模式采集 V2（大页列表 + 批量详情 + 策略轮转）
       console.log(`[JobHunter] Searching: ${keyword} in ${city.name} (V2 buffer mode)`);
       const seenJobIds = isManualTask ? new Set() : await this.getSeenJobIdsSet();
-      
-      const crawlResult = await this.executeBufferedBossCrawl(tab.id, {
-        keyword,
-        cityCode: city.code,
-        experience: this.getExperienceCode(),
-        isManualTask,
-        seenJobIds,
-        deliveryBatchId,
-        city,
-        manualKeyword: isManualTask ? keyword : ''
-      });
 
-      // 合并结果到外部变量
-      allJobs.push(...crawlResult.allJobs);
-      filteredJobs.push(...crawlResult.filteredJobs);
+      for (let experienceIndex = 0; experienceIndex < experienceCodes.length && this.isRunning; experienceIndex++) {
+        const experienceCode = experienceCodes[experienceIndex];
+        this.runStats.experienceLabel = this.getExperienceLabel(experienceCode);
+        this.runStats.experienceRunIndex = experienceIndex + 1;
+        this.runStats.experienceRunTotal = experienceCodes.length;
+        console.log(`[JobHunter] Experience run ${experienceIndex + 1}/${experienceCodes.length}: ${this.runStats.experienceLabel}`);
 
-      // 如果 executeBufferedBossCrawl 返回了新的活跃 tab（策略切换时可能重建），更新本地 tab 以便 finally 正确关闭最新 tab
-      if (crawlResult && crawlResult.tabId) {
-        try {
-          tab = { ...tab, id: crawlResult.tabId };
-        } catch (_) {}
-      }
+        const crawlResult = await this.executeBufferedBossCrawl(tab.id, {
+          keyword,
+          cityCode: city.code,
+          experience: experienceCode,
+          isManualTask,
+          seenJobIds,
+          deliveryBatchId,
+          city,
+          manualKeyword: isManualTask ? keyword : ''
+        });
 
-      if (crawlResult.antiCrawlTriggered) {
-        antiCrawlTriggered = true;
-        await this.transitionCrawlState('anti_crawl');
-        if (!fromController) {
-          await this.putBackTask(task);
+        // 合并结果到外部变量
+        allJobs.push(...crawlResult.allJobs);
+        filteredJobs.push(...crawlResult.filteredJobs);
+
+        // 如果 executeBufferedBossCrawl 返回了新的活跃 tab（策略切换时可能重建），更新本地 tab 以便 finally 正确关闭最新 tab
+        if (crawlResult && crawlResult.tabId) {
+          try {
+            tab = { ...tab, id: crawlResult.tabId };
+          } catch (_) {}
+        }
+
+        incrementalInsertedCount += crawlResult.incrementalInsertedCount;
+
+        // 更新 runStats
+        this.runStats.listCount += crawlResult.totalListed;
+        this.runStats.pagedListCount += crawlResult.totalListed;
+        this.runStats.pagesFetched += crawlResult.strategyReport.reduce((sum, r) => sum + r.pagesSuccess, 0);
+        this.runStats.totalJobs += crawlResult.allJobs.length;
+
+        if (crawlResult.antiCrawlTriggered) {
+          antiCrawlTriggered = true;
+          await this.transitionCrawlState('anti_crawl');
+          if (!fromController) {
+            await this.putBackTask(task);
+          }
+          break;
+        }
+
+        if (experienceIndex < experienceCodes.length - 1 && this.isRunning) {
+          await this.sleep(1500 + Math.random() * 1000);
         }
       }
-      incrementalInsertedCount = crawlResult.incrementalInsertedCount;
-
-      // 更新 runStats
-      this.runStats.listCount = crawlResult.totalListed;
-      this.runStats.pagedListCount = crawlResult.totalListed;
-      this.runStats.pagesFetched = crawlResult.strategyReport.reduce((sum, r) => sum + r.pagesSuccess, 0);
-      this.runStats.totalJobs += crawlResult.allJobs.length;
 
       // 搜索成功状态
-      if (crawlResult.allJobs.length > 0 && !antiCrawlTriggered) {
+      if (allJobs.length > 0 && !antiCrawlTriggered) {
         if (this.consecutiveFailures > 0) {
           console.log(`[JobHunter] ✅ Crawl success, resetting failure count`);
           this.consecutiveFailures = 0;
@@ -1153,7 +1316,7 @@ class JobHunterService {
         await this.transitionCrawlState('success');
       }
 
-      if (crawlResult.allJobs.length === 0 && !antiCrawlTriggered) {
+      if (allJobs.length === 0 && !antiCrawlTriggered) {
         console.log(`[JobHunter] No jobs collected for ${keyword} in ${city.name}`);
         this.isRunning = false;
         await this.saveStats();
@@ -2508,6 +2671,7 @@ class JobHunterService {
           activeTabId = await this.recreateBossTaskTab(activeTabId, {
             keyword,
             cityCode,
+            experience,
             isManualTask
           });
         } catch (err) {
@@ -2577,16 +2741,19 @@ class JobHunterService {
     };
   }
 
-  buildBossSearchUrl(keyword, cityCode) {
+  buildBossSearchUrl(keyword, cityCode, experience = '') {
     const params = new URLSearchParams({
       query: keyword,
       city: cityCode
     });
+    if (experience) {
+      params.set('experience', experience);
+    }
     return `https://www.zhipin.com/web/geek/jobs?${params.toString()}`;
   }
 
   // 重建 Boss 搜索标签页（用于策略切换时换环境）
-  async recreateBossTaskTab(currentTabId, { keyword, cityCode, isManualTask }) {
+  async recreateBossTaskTab(currentTabId, { keyword, cityCode, experience, isManualTask }) {
     try {
       if (currentTabId) {
         await this.closeTabIfNeeded(currentTabId);
@@ -2594,7 +2761,7 @@ class JobHunterService {
     } catch (_) {}
 
     const newTab = await this.createTabWithRetry({
-      url: this.buildBossSearchUrl(keyword, cityCode),
+      url: this.buildBossSearchUrl(keyword, cityCode, experience),
       active: Boolean(isManualTask)
     });
 
@@ -2673,10 +2840,18 @@ class JobHunterService {
     let score = 0;
     const title = job.jobName || '';
     const exp = job.jobExperience || '';
+    const company = job.brandName || '';
     const titleLower = title.toLowerCase();
     const filterMode = this.getJobFilterMode();
     const expHardExclude = this.getExpHardExcludeRegex();
     const manualKeyword = (options.manualKeyword || '').trim();
+
+    // 硬排除：外包公司
+    for (const kw of CONFIG.FILTER.OUTSOURCING_COMPANIES) {
+      if (company.includes(kw)) {
+        return { score: -10, reason: `外包公司"${company}"` };
+      }
+    }
 
     // 硬排除：标题命中明确的校招性质词
     if (CONFIG.FILTER.TITLE_HARD_EXCLUDE.test(title)) {

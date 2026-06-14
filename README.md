@@ -7,7 +7,7 @@
   <img src="https://img.shields.io/badge/后端-Node.js_18+-339933?logo=node.js&logoColor=white" alt="Node.js">
   <img src="https://img.shields.io/badge/AI-多模型支持-purple?logo=openai&logoColor=white" alt="Multi-AI">
   <img src="https://img.shields.io/badge/数据库-SQLite-003B57?logo=sqlite&logoColor=white" alt="SQLite">
-  <img src="https://img.shields.io/badge/版本-v2.1-brightgreen" alt="Version">
+  <img src="https://img.shields.io/badge/版本-v2.2-brightgreen" alt="Version">
 </p>
 
 ---
@@ -63,7 +63,14 @@
 ### 📊 数据面板
 - **统一仪表盘**：三栏布局 — 岗位列表 | 简历预览 | AI 助手
 - **采集监控**：实时查看采集进度、策略状态、错误日志
-- **投递管理**：支持飞书自动投递和投递状态追踪
+- **投递管理**：收藏列表支持 Boss 单条投递、匹配岗位投递、全部 Boss 收藏投递
+- **AI 收藏筛选**：支持预览筛选结果、执行筛选、5 分钟内撤销，避免误删收藏
+
+### 📤 自动投递
+- **Boss 自动沟通队列**：扩展后台按队列打开岗位页，定位“立即沟通”按钮并执行投递动作
+- **批量投递入口**：可从工作台收藏列表触发单条、匹配岗位或全部 Boss 收藏岗位
+- **状态识别**：识别已沟通、登录要求、安全验证、岗位下线、频率限制等结果
+- **本地状态存储**：投递队列只保存在 Chrome 扩展本地 storage，不提交到 GitHub
 
 ---
 
@@ -93,6 +100,18 @@ cd controller && node server.js
 ```
 
 > 安装脚本会自动检测 Node.js、安装依赖、创建本地配置文件。
+
+### 自动投递使用
+
+1. 启动后端：`cd controller && node server.js`
+2. 加载或刷新 `crawler/extension/` 扩展
+3. 在 Boss 直聘网页登录自己的账号，并保持 Chrome 会话有效
+4. 在 Dashboard → 工作台 → 收藏列表中选择：
+   - `投递该岗位`：只投递当前 Boss 收藏岗位
+   - `投递匹配`：投递画像匹配分大于 50 的 Boss 收藏岗位；如果没有评分字段，则回退为全部 Boss 收藏岗位
+   - `全部投递`：投递所有 Boss 收藏岗位
+
+> 自动投递依赖当前浏览器登录态；遇到登录页或安全验证页时会停止该条任务并保留页面，需人工处理。
 
 ### AI 助手配置
 
@@ -126,6 +145,7 @@ zhaopin/
 ├── crawler/extension/         # Chrome 扩展 (MV3)
 │   ├── manifest.json          # 扩展清单
 │   ├── background.js          # Service Worker (采集引擎)
+│   ├── boss-chat.js           # Boss 自动沟通/投递队列
 │   ├── content.js             # Boss 内容脚本 (DOM 交互)
 │   ├── content-51job.js       # 51Job 内容脚本
 │   ├── content-zhaopin.js     # 智联招聘内容脚本
@@ -191,6 +211,16 @@ AI 通过结构化操作精准修改简历，而非全量覆盖：
 | BOSS_RUN_UNTIL_EXHAUSTED | true | 是否抓取至结果耗尽 |
 | MAX_LIST_PAGE_SIZE | 30 | 列表页每页大小 |
 
+### 不上传到 GitHub 的本地文件
+
+以下内容仅保留在本机，已通过 `.gitignore` 排除：
+
+- `controller/data/`、`controller/*.db*`：本地 SQLite 数据库、简历、运行状态
+- `cookies/`、`logs/`、`output/`：Cookie、日志和采集输出
+- `controller/feishu_targets.json`、`controller/runtime_config.json`：个人飞书配置和运行配置
+- `crawler/extension/trigger-batch.html`：本地生成的批量投递触发页，可能包含真实岗位链接
+- `.env`、`.env.*`：环境变量和密钥
+
 ### CLI 接口
 
 ```bash
@@ -212,11 +242,21 @@ curl http://127.0.0.1:7893/results
 
 - **零凭证提交**：API Key、Cookie 等均加密存储在本地 SQLite，不进入版本库
 - **纯本地部署**：所有数据存储在本地，不上传第三方服务
+- **投递数据本地化**：Boss 投递队列和执行状态保存在扩展本地 storage，仓库只包含通用代码
+- **敏感文件忽略**：数据库、简历、Cookie、日志、个人飞书配置和批量任务触发页不提交
 - **合规使用**：请遵守招聘平台服务条款，仅供个人求职使用
 
 ---
 
 ## 📋 更新日志
+
+### v2.2 (2026-06-14)
+- ✅ **Boss 自动投递**：新增 BossChatEngine 队列，支持单条、匹配岗位和全部 Boss 收藏岗位投递
+- ✅ **自动投递状态识别**：识别已沟通、登录、安全验证、岗位下线、频率限制和未知点击结果
+- ✅ **Dashboard 投递入口**：收藏列表增加投递操作按钮，并支持 URL 参数触发单条或待处理批量任务
+- ✅ **Boss 经验筛选**：采集页新增 Boss 经验要求多选，手动采集按所选经验分轮执行
+- ✅ **AI 收藏筛选工具**：新增 preview/apply/undo 筛选工具和结构化经验字段，支持 5 分钟内撤销
+- ✅ **开源提交边界**：显式忽略本地批量触发页、数据库、简历、Cookie、日志和个人配置
 
 ### v2.1 (2026-04-14)
 - ✅ **AI 助手状态抽离**：引入 `wsAssistant` 单一状态源，切页不再丢失对话、流式输出和工具进度

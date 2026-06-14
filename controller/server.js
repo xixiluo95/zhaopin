@@ -50,6 +50,7 @@ const QUEUE_FILE = path.join(__dirname, 'task_queue.json');
 const STATUS_FILE = path.join(__dirname, 'status.json');
 const RESULTS_FILE = path.join(__dirname, 'results.json');
 const ID_COUNTER_FILE = path.join(__dirname, 'task_id_counter.json');
+const BOSS_APPLY_BATCH_FILE = path.join(__dirname, 'data', 'boss_apply_batch_pending.json');
 const DELIVERY_ALERT_WINDOW_MS = 30 * 60 * 1000;
 
 // 城市代码映射（字符串城市名 -> {code, name}）
@@ -966,6 +967,28 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === '/api/delivery/selected' && req.method === 'GET') {
     jobsHandler.handleGetDeliveryList(req, res);
+    return;
+  }
+
+  if (url.pathname === '/api/boss-chat-batch/pending' && req.method === 'GET') {
+    try {
+      if (!fs.existsSync(BOSS_APPLY_BATCH_FILE)) {
+        res.end(JSON.stringify({ success: true, jobs: [], generatedAt: null }));
+        return;
+      }
+
+      const payload = JSON.parse(fs.readFileSync(BOSS_APPLY_BATCH_FILE, 'utf8'));
+      const jobs = Array.isArray(payload.jobs) ? payload.jobs : [];
+      res.end(JSON.stringify({
+        success: true,
+        generatedAt: payload.generatedAt || null,
+        source: payload.source || null,
+        jobs
+      }));
+    } catch (error) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ success: false, error: error.message }));
+    }
     return;
   }
 
